@@ -113,6 +113,19 @@ class CliWaitTests(unittest.TestCase):
         self.mailbox.read_result.assert_not_called()
         wait_mock.assert_not_called()
 
+    def test_screenshot_command_enqueues_bounded_resolution(self):
+        self.mailbox.read_result.return_value = {
+            "job_id": "local-shot", "status": "completed",
+            "result": {"screenshot_path": "queue/screenshots/local-shot.png"},
+        }
+        exit_code = self.run_cli([
+            "capture_screenshot", "--width", "320", "--height", "240", "--wait",
+        ])
+        self.assertEqual(exit_code, 0)
+        job = self.mailbox.enqueue.call_args.args[0]
+        self.assertEqual(job["operation"], "capture_screenshot")
+        self.assertEqual(job["parameters"], {"width": 320, "height": 240})
+
     def test_modeling_command_enqueues_validated_parameters(self):
         self.mailbox.read_result.return_value = {
             "job_id": "local-test", "status": "completed", "result": {"created": True}

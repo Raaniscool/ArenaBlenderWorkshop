@@ -7,7 +7,7 @@ executes a small allowlist from Blender's main-thread timer. It opens no port.
 bl_info = {
     "name": "Arena Blender Workshop MVP",
     "author": "Arena Blender Workshop",
-    "version": (0, 3, 0),
+    "version": (0, 4, 0),
     "blender": (5, 2, 0),
     "location": "3D View > Sidebar > Arena Workshop",
     "description": "Process allowlisted Arena jobs from a local file mailbox",
@@ -16,6 +16,7 @@ bl_info = {
 
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 
 from .mailbox import FileMailbox, default_queue_root
 from .operations import OperationError, execute_job, resolve_startup_scene
@@ -33,7 +34,11 @@ def _utc_now():
 
 
 def _execute(job):
-    return execute_job(_bpy, job, startup_scene=_startup_scene)
+    screenshot_directory = Path(_mailbox.root) / "screenshots" if _mailbox is not None else None
+    return execute_job(
+        _bpy, job, startup_scene=_startup_scene,
+        screenshot_directory=screenshot_directory,
+    )
 
 
 def _failure_response(job, code, message):

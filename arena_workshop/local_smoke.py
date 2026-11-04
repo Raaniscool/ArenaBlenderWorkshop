@@ -83,7 +83,8 @@ def _build_cli_parameters(args):
         params["message"] = "Arena Blender Workshop local add-on smoke test"
 
     for field in ("primitive_type", "object_name", "location", "rotation", "scale",
-                  "new_name", "material_name", "base_color", "roughness", "metallic"):
+                  "new_name", "material_name", "base_color", "roughness", "metallic",
+                  "dimensions", "width", "height"):
         value = getattr(args, field)
         if value is not None:
             params[field] = value
@@ -101,6 +102,10 @@ def main(argv=None):
     parser.add_argument("--rotation", nargs=3, type=float, metavar=("X", "Y", "Z"),
                         help="Euler rotation in degrees")
     parser.add_argument("--scale", nargs=3, type=float, metavar=("X", "Y", "Z"))
+    parser.add_argument("--dimensions", nargs=3, type=float, metavar=("X", "Y", "Z"),
+                        help="set mesh object dimensions in Blender units")
+    parser.add_argument("--width", type=int, help="screenshot width (64-1280, default 640)")
+    parser.add_argument("--height", type=int, help="screenshot height (64-720, default 480)")
     parser.add_argument("--new-name")
     parser.add_argument("--material-name")
     parser.add_argument("--base-color", nargs=4, type=float, metavar=("R", "G", "B", "A"),

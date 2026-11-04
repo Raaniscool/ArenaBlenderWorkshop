@@ -1,6 +1,8 @@
 import math
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from arena_workshop.operations import (
     SMOKE_TEST_OBJECT,
@@ -24,6 +26,13 @@ class FakeMesh:
 
     def update(self):
         pass
+
+    def copy(self):
+        mesh = self._collection.new(self.name)
+        mesh.vertices = list(self.vertices)
+        mesh.polygons = list(self.polygons)
+        mesh.materials = list(self.materials)
+        return mesh
 
 
 class FakeNodeSocket:
@@ -103,6 +112,25 @@ class FakeObject(FakeDataBlock):
         self.location = (0.0, 0.0, 0.0)
         self.rotation_euler = (0.0, 0.0, 0.0)
         self.scale = (1.0, 1.0, 1.0)
+        self.type = "MESH"
+        self._dimensions = (2.0, 2.0, 2.0)
+
+    @property
+    def dimensions(self):
+        return self._dimensions
+
+    @dimensions.setter
+    def dimensions(self, values):
+        self._dimensions = tuple(values)
+
+    def copy(self):
+        duplicate = self._data_objects.new(self.name, self.data)
+        duplicate.location = tuple(self.location)
+        duplicate.rotation_euler = tuple(self.rotation_euler)
+        duplicate.scale = tuple(self.scale)
+        duplicate.dimensions = tuple(self.dimensions)
+        duplicate._custom_properties = dict(self._custom_properties)
+        return duplicate
 
     @property
     def name(self):
@@ -138,6 +166,9 @@ class FakeScene:
         self.name = name
         self.objects = FakeSceneObjects()
         self.collection = FakeSceneCollection(self.objects)
+        self.render = FakeRenderSettings()
+        self.cycles = FakeCycles()
+        self.camera = None
 
 
 class FakeScenes(dict):
@@ -182,11 +213,51 @@ class FakeMeshes(dict):
             unique_name = "{}.{}".format(name, suffix)
             suffix += 1
         mesh = FakeMesh(unique_name)
+        mesh._collection = self
         self[unique_name] = mesh
         return mesh
 
     def remove(self, mesh):
         self.pop(mesh.name, None)
+
+
+class FakeImageSettings:
+    def __init__(self):
+        self.file_format = "JPEG"
+        self.color_mode = "RGB"
+
+
+class FakeRenderSettings:
+    def __init__(self):
+        self.filepath = "//existing-render"
+        self.use_file_extension = True
+        self.resolution_x = 1920
+        self.resolution_y = 1080
+        self.resolution_percentage = 50
+        self.engine = "CYCLES"
+        self.display_mode = "WINDOW"
+        self.image_settings = FakeImageSettings()
+
+
+class FakeCycles:
+    def __init__(self):
+        self.samples = 64
+
+
+class FakeRenderOperator:
+    def __init__(self, bpy):
+        self.bpy = bpy
+        self.calls = []
+        self.error = None
+        self.status = {"FINISHED"}
+
+    def render(self, write_still, scene):
+        self.calls.append({"write_still": write_still, "scene": scene})
+        if self.error is not None:
+            raise self.error
+        target_scene = self.bpy.data.scenes.get(scene)
+        Path(target_scene.render.filepath).write_bytes(b"fake-png-image")
+        return self.status
 
 
 class FakeBpy:
@@ -210,10 +281,18 @@ class FakeBpy:
         )
         self.default_cube = self.data.objects.new("Cube", cube_mesh)
         startup_scene.collection.objects.link(self.default_cube)
+        camera_data = self.data.meshes.new("CameraData")
+        self.camera = self.data.objects.new("Camera", camera_data)
+        self.camera.type = "CAMERA"
+        startup_scene.collection.objects.link(self.camera)
+        startup_scene.camera = self.camera
         self.startup_scene = startup_scene
         self.switched_scene = switched_scene
         self.context = type("FakeContext", (), {"scene": startup_scene})()
         self.app = type("FakeApp", (), {"version_string": "5.2.0 test fake"})()
+        self.render_operator = FakeRenderOperator(self)
+        self.ops = type("FakeOps", (), {})()
+        self.ops.render = self.render_operator
 
 
 def make_job(operation, parameters, job_id="job-001"):
@@ -248,6 +327,10 @@ class ModelingProtocolTests(unittest.TestCase):
                 "material_name": "Mat", "object_name": "Block",
                 "base_color": [0.2, 0.4, 0.6, 1.0], "roughness": 0.5, "metallic": 0.1,
             }),
+            ("capture_screenshot", {"width": 640, "height": 480}),
+            ("duplicate_object", {"object_name": "Block", "new_name": "BlockCopy"}),
+            ("delete_object", {"object_name": "Block"}),
+            ("set_dimensions", {"object_name": "Block", "dimensions": [1, 2, 3]}),
         ]
         for operation, params in cases:
             with self.subTest(operation=operation):
@@ -264,6 +347,20 @@ class ModelingProtocolTests(unittest.TestCase):
         for params in invalid:
             with self.subTest(params=params), self.assertRaises(JobValidationError):
                 validated(make_job("create_primitive", params))
+
+    def test_screenshot_and_new_modeling_protocols_reject_invalid_parameters(self):
+        invalid = [
+            ("capture_screenshot", {"width": 2000}),
+            ("capture_screenshot", {"height": 0}),
+            ("capture_screenshot", {"execute": "unsafe"}),
+            ("duplicate_object", {"object_name": "Block"}),
+            ("duplicate_object", {"object_name": "Same", "new_name": "Same"}),
+            ("delete_object", {"object_name": "Block", "force": True}),
+            ("set_dimensions", {"object_name": "Block", "dimensions": [1, 0, 1]}),
+        ]
+        for operation, params in invalid:
+            with self.subTest(operation=operation, params=params), self.assertRaises(JobValidationError):
+                validated(make_job(operation, params))
 
     def test_transform_protocols_reject_bad_vectors(self):
         cases = [
@@ -311,9 +408,13 @@ class ModelingOperationTests(unittest.TestCase):
         self.original_cube = self.bpy.default_cube
         self.original_cube_mesh = self.original_cube.data
 
-    def run_job(self, operation, parameters, job_id="job-001", startup_scene=None):
+    def run_job(self, operation, parameters, job_id="job-001", startup_scene=None,
+                screenshot_directory=None):
         job = validated(make_job(operation, parameters, job_id=job_id))
-        return execute_job(self.bpy, job, startup_scene=startup_scene)
+        return execute_job(
+            self.bpy, job, startup_scene=startup_scene,
+            screenshot_directory=screenshot_directory,
+        )
 
     def test_create_each_primitive_with_expected_mesh(self):
         expected = {
@@ -363,12 +464,42 @@ class ModelingOperationTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "object_name_conflict")
         self.assertIs(self.bpy.data.objects["Protected"], original)
 
+    def test_duplicate_object_copies_mesh_and_preserves_source(self):
+        self.original_cube.location = (2.0, 3.0, 4.0)
+        params = {"object_name": "Cube", "new_name": "CubeCopy"}
+        first = self.run_job("duplicate_object", params, "duplicate-1")
+        duplicate = self.bpy.data.objects["CubeCopy"]
+        second = self.run_job("duplicate_object", params, "duplicate-1")
+        self.assertTrue(first["duplicated"])
+        self.assertFalse(second["duplicated"])
+        self.assertIsNot(duplicate, self.original_cube)
+        self.assertIsNot(duplicate.data, self.original_cube.data)
+        self.assertEqual(duplicate.location, (3.0, 3.0, 4.0))
+        self.assertEqual(len(duplicate.data.polygons), len(self.original_cube.data.polygons))
+        self.assertIs(self.startup_scene.objects.get("CubeCopy"), duplicate)
+
+    def test_set_dimensions_and_delete_only_explicit_object(self):
+        target = self.bpy.data.objects.new("Disposable", self.bpy.data.meshes.new("DisposableMesh"))
+        protected = self.bpy.data.objects.new("Protected", self.bpy.data.meshes.new("ProtectedMesh"))
+        self.startup_scene.collection.objects.link(target)
+        self.startup_scene.collection.objects.link(protected)
+        result = self.run_job(
+            "set_dimensions", {"object_name": "Disposable", "dimensions": [1, 2, 3]}
+        )
+        self.assertEqual(result["dimensions"], [1.0, 2.0, 3.0])
+        self.assertEqual(target.dimensions, (1.0, 2.0, 3.0))
+        deleted = self.run_job("delete_object", {"object_name": "Disposable"})
+        self.assertTrue(deleted["deleted"])
+        self.assertNotIn("Disposable", self.bpy.data.objects)
+        self.assertIs(self.bpy.data.objects["Cube"], self.original_cube)
+        self.assertIs(self.bpy.data.objects["Protected"], protected)
+
     def test_create_test_object_remains_idempotent_and_preserves_default_cube(self):
         first = self.run_job("create_test_object", {})
         second = self.run_job("create_test_object", {}, job_id="different-job")
         self.assertTrue(first["created"])
         self.assertFalse(second["created"])
-        self.assertEqual(len(self.bpy.data.objects), 2)
+        self.assertEqual(len(self.bpy.data.objects), 3)
         self.assertIs(self.bpy.data.objects["Cube"], self.original_cube)
         self.assertIs(self.startup_scene.objects.get(SMOKE_TEST_OBJECT), self.bpy.data.objects[SMOKE_TEST_OBJECT])
 
@@ -464,6 +595,74 @@ class ModelingOperationTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "material_name_conflict")
         self.assertIs(self.bpy.data.materials["ProtectedMaterial"], original)
         self.assertEqual(original.diffuse_color, (0.1, 0.2, 0.3, 1.0))
+
+    def test_screenshot_is_written_with_metadata_and_render_settings_restored(self):
+        scene = self.startup_scene
+        render = scene.render
+        original = (render.filepath, render.use_file_extension, render.resolution_x,
+                    render.resolution_y, render.resolution_percentage, render.display_mode,
+                    render.image_settings.file_format, render.image_settings.color_mode,
+                    scene.cycles.samples)
+        with tempfile.TemporaryDirectory() as directory:
+            self.bpy.context.scene = self.bpy.switched_scene
+            result = self.run_job(
+                "capture_screenshot", {"width": 320, "height": 240},
+                job_id="screenshot-1", screenshot_directory=directory,
+            )
+            screenshot = Path(result["screenshot_path"])
+            self.assertTrue(screenshot.is_file())
+            self.assertEqual(screenshot.read_bytes(), b"fake-png-image")
+            self.assertEqual(result["scene_name"], scene.name)
+            self.assertEqual(result["camera_name"], self.bpy.camera.name)
+            self.assertEqual((result["width"], result["height"]), (320, 240))
+            self.assertEqual(result["format"], "PNG")
+            self.assertEqual(result["render_engine"], "CYCLES")
+            self.assertEqual(result["size_bytes"], len(b"fake-png-image"))
+            self.assertEqual(len(result["sha256"]), 64)
+            self.assertEqual(self.bpy.render_operator.calls[-1], {
+                "write_still": True, "scene": scene.name,
+            })
+            self.assertEqual((render.filepath, render.use_file_extension, render.resolution_x,
+                              render.resolution_y, render.resolution_percentage, render.display_mode,
+                              render.image_settings.file_format, render.image_settings.color_mode,
+                              scene.cycles.samples), original)
+            self.assertIs(self.bpy.context.scene, self.bpy.switched_scene)
+
+    def test_screenshot_reports_missing_camera_and_render_failure(self):
+        scene = self.startup_scene
+        with tempfile.TemporaryDirectory() as directory:
+            scene.camera = None
+            with self.assertRaises(OperationError) as missing:
+                self.run_job(
+                    "capture_screenshot", {}, "missing-camera",
+                    screenshot_directory=directory,
+                )
+            self.assertEqual(missing.exception.code, "camera_not_found")
+            self.assertFalse(self.bpy.render_operator.calls)
+
+            scene.camera = self.bpy.camera
+            self.bpy.render_operator.error = RuntimeError("render failed")
+            original_render_settings = (
+                scene.render.filepath, scene.render.use_file_extension,
+                scene.render.resolution_x, scene.render.resolution_y,
+                scene.render.resolution_percentage, scene.render.display_mode,
+                scene.render.image_settings.file_format,
+                scene.render.image_settings.color_mode, scene.cycles.samples,
+            )
+            with self.assertRaises(OperationError) as failed:
+                self.run_job(
+                    "capture_screenshot", {}, "render-error",
+                    screenshot_directory=directory,
+                )
+            self.assertEqual(failed.exception.code, "screenshot_render_failed")
+            self.assertEqual((
+                scene.render.filepath, scene.render.use_file_extension,
+                scene.render.resolution_x, scene.render.resolution_y,
+                scene.render.resolution_percentage, scene.render.display_mode,
+                scene.render.image_settings.file_format,
+                scene.render.image_settings.color_mode, scene.cycles.samples,
+            ), original_render_settings)
+            self.assertFalse(list(Path(directory).iterdir()))
 
     def test_missing_objects_return_clear_errors_for_targeted_operations(self):
         cases = [

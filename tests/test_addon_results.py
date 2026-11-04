@@ -1,6 +1,7 @@
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -83,6 +84,20 @@ class TestMailbox:
         self.result = result
 
 
+class SequenceMailbox:
+    root = "fake-mailbox"
+
+    def __init__(self, jobs):
+        self.jobs = list(jobs)
+        self.results = []
+
+    def claim_next(self, allowed_workspaces):
+        return self.jobs.pop(0) if self.jobs else None
+
+    def write_result(self, result):
+        self.results.append(result)
+
+
 class AddonResultTests(unittest.TestCase):
     def test_registration_defers_scene_capture_and_cleans_timers(self):
         previous = (addon._bpy, addon._mailbox, addon._startup_scene, addon._registered)
@@ -118,7 +133,8 @@ class AddonResultTests(unittest.TestCase):
                 with patch.object(addon, "execute_job", return_value={"scene_name": "Scene"}) as execute:
                     addon._execute(job)
                 execute.assert_called_once_with(
-                    bpy_instance, job, startup_scene=captured_scene
+                    bpy_instance, job, startup_scene=captured_scene,
+                    screenshot_directory=Path("deferred-mailbox") / "screenshots",
                 )
                 self.assertIs(addon._startup_scene, captured_scene)
 
@@ -145,18 +161,57 @@ class AddonResultTests(unittest.TestCase):
                 addon.unregister()
             addon._bpy, addon._mailbox, addon._startup_scene, addon._registered = previous
 
+    def test_sequential_jobs_publish_screenshot_metadata_results(self):
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+
+        def job(job_id, operation):
+            return {
+                "protocol_version": "1.0", "job_id": job_id, "workspace_id": "test",
+                "operation": operation, "parameters": {}, "status": "queued",
+                "created_at": now.isoformat().replace("+00:00", "Z"),
+                "deadline": (now + timedelta(minutes=5)).isoformat().replace("+00:00", "Z"),
+                "result": None, "error": None,
+            }
+
+        screenshot = {
+            "screenshot_path": "C:/queue/screenshots/job-shot.png",
+            "scene_name": "Scene", "width": 640, "height": 480, "format": "PNG",
+        }
+        mailbox = SequenceMailbox([job("job-shot", "capture_screenshot"),
+                                  job("job-next", "create_test_object")])
+        previous = (addon._bpy, addon._mailbox, addon._startup_scene, addon._registered)
+        test_bpy = TestBpy()
+        addon._bpy = test_bpy
+        addon._mailbox = mailbox
+        addon._startup_scene = test_bpy.data.scenes.startup_scene
+        addon._registered = True
+        try:
+            with patch.object(addon, "execute_job", side_effect=[screenshot, {"created": True}]) as execute:
+                self.assertEqual(addon._poll_mailbox(), addon._POLL_SECONDS)
+                self.assertEqual(addon._poll_mailbox(), addon._POLL_SECONDS)
+            self.assertEqual(execute.call_count, 2)
+        finally:
+            addon._bpy, addon._mailbox, addon._startup_scene, addon._registered = previous
+
+        self.assertEqual([result["job_id"] for result in mailbox.results], ["job-shot", "job-next"])
+        self.assertEqual(mailbox.results[0]["status"], "completed")
+        self.assertEqual(mailbox.results[0]["result"], screenshot)
+        self.assertEqual(mailbox.results[0]["result"]["screenshot_path"], screenshot["screenshot_path"])
+
     def test_execute_uses_scene_captured_at_registration(self):
-        previous_bpy, previous_scene = addon._bpy, addon._startup_scene
+        previous_bpy, previous_scene, previous_mailbox = addon._bpy, addon._startup_scene, addon._mailbox
         bpy_instance = TestBpy()
         startup_scene = bpy_instance.data.scenes.get("Scene")
         job = {"job_id": "scene-target"}
-        addon._bpy, addon._startup_scene = bpy_instance, startup_scene
+        addon._bpy, addon._startup_scene, addon._mailbox = bpy_instance, startup_scene, None
         try:
             with patch.object(addon, "execute_job", return_value={"scene_name": "Scene"}) as execute:
                 self.assertEqual(addon._execute(job), {"scene_name": "Scene"})
-            execute.assert_called_once_with(bpy_instance, job, startup_scene=startup_scene)
+            execute.assert_called_once_with(
+                bpy_instance, job, startup_scene=startup_scene, screenshot_directory=None
+            )
         finally:
-            addon._bpy, addon._startup_scene = previous_bpy, previous_scene
+            addon._bpy, addon._startup_scene, addon._mailbox = previous_bpy, previous_scene, previous_mailbox
 
     def test_missing_object_is_written_as_structured_failure_result(self):
         now = datetime.now(timezone.utc).replace(microsecond=0)

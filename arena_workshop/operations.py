@@ -1,8 +1,10 @@
-"""Restricted Blender data API operations; no bpy.ops or arbitrary code execution."""
+"""Restricted Blender data operations plus one bounded render operator for screenshots."""
 
 import hashlib
 import json
 import math
+import os
+from pathlib import Path
 from math import cos, pi, sin
 
 from .protocol import JobValidationError
@@ -418,8 +420,198 @@ def _create_material(bpy, job, scene):
     }
 
 
-def execute_job(bpy, job, startup_scene=None):
-    """Execute one validated job using Blender's data API only."""
+def _duplicate_object(bpy, job, scene):
+    params = job["parameters"]
+    source = _find_object(scene, params["object_name"])
+    if getattr(source, "type", None) != "MESH" or getattr(source, "data", None) is None:
+        raise OperationError(
+            "duplicate_unsupported_object",
+            "Only mesh objects with mesh data can be duplicated.",
+        )
+
+    new_name = params["new_name"]
+    existing = bpy.data.objects.get(new_name)
+    if existing is not None:
+        if scene.objects.get(new_name) is existing and _retry_matches(existing, job):
+            return {"object_name": existing.name, "source_name": source.name,
+                    "scene_name": scene.name, "duplicated": False}
+        raise OperationError(
+            "object_name_conflict",
+            "Object {!r} already exists and will not be replaced.".format(new_name),
+        )
+
+    duplicate = None
+    mesh_copy = None
+    try:
+        duplicate = source.copy()
+        mesh_copy = source.data.copy()
+        duplicate.data = mesh_copy
+        duplicate.name = new_name
+        if duplicate.name != new_name:
+            raise OperationError("object_name_conflict", "Blender could not preserve the requested object name.")
+        scene.collection.objects.link(duplicate)
+        if "location" in params:
+            duplicate.location = tuple(float(value) for value in params["location"])
+        else:
+            duplicate.location = (float(source.location[0]) + 1.0,
+                                  float(source.location[1]), float(source.location[2]))
+        _tag(duplicate, job)
+    except OperationError:
+        if duplicate is not None:
+            bpy.data.objects.remove(duplicate, do_unlink=True)
+        if mesh_copy is not None:
+            bpy.data.meshes.remove(mesh_copy)
+        raise
+    except Exception as exc:
+        if duplicate is not None:
+            bpy.data.objects.remove(duplicate, do_unlink=True)
+        if mesh_copy is not None:
+            bpy.data.meshes.remove(mesh_copy)
+        raise OperationError(
+            "blender_duplicate_failed",
+            "Blender could not duplicate the mesh object ({}).".format(type(exc).__name__),
+        ) from exc
+    return {"object_name": duplicate.name, "source_name": source.name,
+            "scene_name": scene.name, "duplicated": True,
+            "location": list(duplicate.location)}
+
+
+def _delete_object(bpy, job, scene):
+    name = job["parameters"]["object_name"]
+    obj = _find_object(scene, name)
+    bpy.data.objects.remove(obj, do_unlink=True)
+    return {"object_name": name, "scene_name": scene.name, "deleted": True}
+
+
+def _set_dimensions(job, scene):
+    params = job["parameters"]
+    obj = _find_object(scene, params["object_name"])
+    dimensions = tuple(float(value) for value in params["dimensions"])
+    try:
+        obj.dimensions = dimensions
+    except Exception as exc:
+        raise OperationError(
+            "dimensions_update_failed",
+            "Blender could not set the object dimensions ({}).".format(type(exc).__name__),
+        ) from exc
+    return {"object_name": obj.name, "scene_name": scene.name,
+            "dimensions": list(dimensions), "updated": True}
+
+
+def _capture_screenshot(bpy, job, scene, screenshot_directory):
+    if screenshot_directory is None:
+        raise OperationError(
+            "screenshot_storage_unavailable",
+            "No screenshot output directory was configured.",
+        )
+    camera = getattr(scene, "camera", None)
+    if camera is None or scene.objects.get(camera.name) is None:
+        raise OperationError(
+            "camera_not_found",
+            "The captured startup scene has no linked active camera for rendering.",
+        )
+
+    params = job["parameters"]
+    width = params.get("width", 640)
+    height = params.get("height", 480)
+    directory = Path(screenshot_directory)
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise OperationError(
+            "screenshot_storage_failed",
+            "Could not prepare the screenshot directory ({}).".format(type(exc).__name__),
+        ) from exc
+
+    job_id = job["job_id"]
+    final_path = directory / (job_id + ".png")
+    temporary_path = directory / ("." + job_id + ".partial.png")
+    render = scene.render
+    image_settings = render.image_settings
+    render_engine = render.engine
+    original = {
+        "filepath": render.filepath,
+        "use_file_extension": render.use_file_extension,
+        "resolution_x": render.resolution_x,
+        "resolution_y": render.resolution_y,
+        "resolution_percentage": render.resolution_percentage,
+        "file_format": image_settings.file_format,
+        "color_mode": image_settings.color_mode,
+    }
+    cycles = getattr(scene, "cycles", None)
+    original_samples = getattr(cycles, "samples", None) if cycles is not None else None
+    original_display_mode = getattr(render, "display_mode", None)
+    try:
+        render.filepath = str(temporary_path)
+        if original_display_mode is not None:
+            render.display_mode = "NONE"
+        render.use_file_extension = False
+        render.resolution_x = width
+        render.resolution_y = height
+        render.resolution_percentage = 100
+        image_settings.file_format = "PNG"
+        image_settings.color_mode = "RGBA"
+        if cycles is not None and original_samples is not None and render.engine == "CYCLES":
+            cycles.samples = min(original_samples, 8)
+
+        status = bpy.ops.render.render(write_still=True, scene=scene.name)
+        if status is not None and "FINISHED" not in status:
+            raise OperationError("screenshot_render_failed", "Blender cancelled the screenshot render.")
+        if not temporary_path.is_file() or temporary_path.stat().st_size == 0:
+            raise OperationError("screenshot_render_failed", "Blender produced no screenshot image.")
+        os.replace(str(temporary_path), str(final_path))
+    except OperationError:
+        try:
+            temporary_path.unlink()
+        except OSError:
+            pass
+        raise
+    except Exception as exc:
+        try:
+            temporary_path.unlink()
+        except OSError:
+            pass
+        code = "screenshot_storage_failed" if isinstance(exc, OSError) else "screenshot_render_failed"
+        raise OperationError(
+            code,
+            "Could not capture the Blender scene screenshot ({}).".format(type(exc).__name__),
+        ) from exc
+    finally:
+        render.filepath = original["filepath"]
+        render.use_file_extension = original["use_file_extension"]
+        render.resolution_x = original["resolution_x"]
+        render.resolution_y = original["resolution_y"]
+        render.resolution_percentage = original["resolution_percentage"]
+        image_settings.file_format = original["file_format"]
+        image_settings.color_mode = original["color_mode"]
+        if original_display_mode is not None:
+            render.display_mode = original_display_mode
+        if cycles is not None and original_samples is not None:
+            cycles.samples = original_samples
+
+    try:
+        screenshot_bytes = final_path.read_bytes()
+    except OSError as exc:
+        raise OperationError(
+            "screenshot_storage_failed",
+            "Could not read the completed screenshot ({}).".format(type(exc).__name__),
+        ) from exc
+    digest = hashlib.sha256(screenshot_bytes).hexdigest()
+    return {
+        "scene_name": scene.name,
+        "camera_name": camera.name,
+        "screenshot_path": str(final_path.resolve()),
+        "format": "PNG",
+        "render_engine": render_engine,
+        "width": width,
+        "height": height,
+        "size_bytes": len(screenshot_bytes),
+        "sha256": digest,
+    }
+
+
+def execute_job(bpy, job, startup_scene=None, screenshot_directory=None):
+    """Execute one validated job using Blender's main-thread APIs."""
     operation = job["operation"]
     params = job["parameters"]
     if operation == "hello_test":
@@ -441,4 +633,12 @@ def execute_job(bpy, job, startup_scene=None):
         return _rename_object(bpy, job, scene)
     if operation == "create_material":
         return _create_material(bpy, job, scene)
+    if operation == "duplicate_object":
+        return _duplicate_object(bpy, job, scene)
+    if operation == "delete_object":
+        return _delete_object(bpy, job, scene)
+    if operation == "set_dimensions":
+        return _set_dimensions(job, scene)
+    if operation == "capture_screenshot":
+        return _capture_screenshot(bpy, job, scene, screenshot_directory)
     raise JobValidationError("unsupported_operation")

@@ -2,7 +2,7 @@
 
 A local Blender connector using a strict JSON protocol and an atomic file mailbox. The Blender add-on polls the mailbox using a Blender application timer and runs the fixed operation allowlist on Blender's main thread. The bridge opens no network listener and does not use arbitrary Python, shell commands, or unrestricted Blender operators.
 
-## Phase 3A.1: basic modeling operations in the startup scene
+## Phase 3B: startup-scene modeling and screenshot feedback
 
 The protocol remains version `1.0`; previous `hello_test` and `create_test_object` jobs continue to work. The current allowlist is:
 
@@ -16,10 +16,28 @@ The protocol remains version `1.0`; previous `hello_test` and `create_test_objec
 | `scale_object` | `object_name`, `scale` | Sets the object's scale; zero components are rejected. |
 | `rename_object` | `object_name`, `new_name` | Renames the existing object; does not create a replacement. |
 | `create_material` | `material_name`, `object_name`, `base_color`, `roughness`, `metallic` | Creates a Principled material and assigns it to the named mesh object. `base_color` is linear RGBA. |
+| `duplicate_object` | `object_name`, `new_name` | Copies a named mesh and its data into the startup scene; default placement offsets one Blender unit on X. Optional `location` overrides placement. |
+| `set_dimensions` | `object_name`, `dimensions` | Sets positive X/Y/Z dimensions in Blender units. |
+| `delete_object` | `object_name` | Deletes only the explicitly named startup-scene object. This is destructive and has no undo step in the add-on. |
+| `capture_screenshot` | none | Renders the captured startup scene through its active camera. Optional `width` (64–1280) and `height` (64–720); defaults to 640×480. |
 
 Vectors are three numeric values except `base_color`, which has four. Location, rotation, scale, color, roughness, and metallic are range-checked; object/material names are bounded and checked. Unknown fields and operations are rejected. Name conflicts and missing targets return structured failure results rather than replacing objects or materials.
 
-At add-on registration, the target is resolved to Blender's existing normal startup scene (normally `Scene`, containing the original `Cube`) and retained for every job, even if the user later switches the active scene. Jobs do not create a separate scene or change the active scene. Newly created objects are linked to that startup scene. The original cube and unrelated existing objects and materials are preserved; only an explicitly named object is transformed, renamed, or assigned a newly created material. Modeling results report the actual target scene name. Creating a primitive with a retried job ID is idempotent; a different job cannot silently replace an object with the same name. Transforms are assignments and can be retried safely. No operation saves or overwrites the `.blend` file.
+At add-on initialization, the target is captured from Blender's existing normal startup scene (normally `Scene`, containing the original `Cube`) and retained for every job, even if the user later switches the active scene. Initialization is deferred through a Blender application timer, outside the restricted add-on registration context. Jobs do not create a separate scene or change the active scene. Newly created and duplicated objects are linked to the captured startup scene. Objects and materials are preserved unless an operation explicitly names them; `delete_object` is the only deletion operation. Modeling results report the actual target scene name. Creating a primitive with a retried job ID is idempotent; a different job cannot silently replace an object with the same name. No operation saves or overwrites the `.blend` file.
+
+### Screenshot feedback loop
+
+`capture_screenshot` renders the captured startup scene using its existing active camera and the current render engine. Blender temporarily sets a bounded PNG resolution (default 640×480, maximum 1280×720), disables render-window display for the capture, and restores the scene's render filepath, output format, resolution, display mode, and Cycles sample count afterward. It does not change the active scene, camera, workspace, or save the `.blend` file. A missing/unlinked camera and render failures return structured job errors.
+
+Screenshots are retained at:
+
+```text
+%LOCALAPPDATA%\ArenaBlenderWorkshop\queue\screenshots\<job_id>.png
+```
+
+The completed JSON result includes the absolute `screenshot_path`, scene/camera names, dimensions, render engine, byte size, format, and SHA-256. The mailbox is local to the Windows Blender/CLI user; it does **not** upload images to Arena. To let Arena inspect a result, attach the PNG from the returned path in the Arena conversation. This manual attachment is currently required; the repository has no authenticated screenshot-transfer service.
+
+Iterate visually by submitting a modeling job, waiting for its result, attaching the returned PNG for review, then submitting a follow-up job (for example `move_object`, `set_dimensions`, or `create_material`) and capturing another screenshot. `duplicate_object` is restricted to mesh objects and copies mesh data. `delete_object` is intentionally explicit and irreversible through this add-on; use it only for a named object you intend to remove.
 
 ## Install or update the add-on in Blender 5.2 on Windows
 
@@ -50,26 +68,24 @@ Basic test sequence (use unique names if repeating the create commands):
 ```powershell
 python -m unittest discover -s tests -v
 python -m arena_workshop hello_test --wait --timeout 120
-python -m arena_workshop create_test_object --wait --timeout 120
 python -m arena_workshop create_primitive --primitive-type cube --object-name Phase3Cube --location 0 0 0 --rotation 0 0 0 --scale 1 1 1 --wait --timeout 120
-python -m arena_workshop move_object --object-name Phase3Cube --location 1 2 3 --wait --timeout 120
-python -m arena_workshop rotate_object --object-name Phase3Cube --rotation 0 0 45 --wait --timeout 120
-python -m arena_workshop scale_object --object-name Phase3Cube --scale 2 2 2 --wait --timeout 120
-python -m arena_workshop rename_object --object-name Phase3Cube --new-name Phase3CubeRenamed --wait --timeout 120
-python -m arena_workshop create_material --material-name Phase3Material --object-name Phase3CubeRenamed --base-color 0.8 0.3 0.1 1 --roughness 0.35 --metallic 0.7 --wait --timeout 120
-python -m arena_workshop create_primitive --primitive-type uv_sphere --object-name Phase3Sphere --wait --timeout 120
-python -m arena_workshop create_primitive --primitive-type cylinder --object-name Phase3Cylinder --wait --timeout 120
-python -m arena_workshop create_primitive --primitive-type plane --object-name Phase3Plane --wait --timeout 120
-python -m arena_workshop create_primitive --primitive-type cone --object-name Phase3Cone --wait --timeout 120
+python -m arena_workshop capture_screenshot --width 640 --height 480 --wait --timeout 180
+python -m arena_workshop set_dimensions --object-name Phase3Cube --dimensions 1 2 3 --wait --timeout 120
+python -m arena_workshop duplicate_object --object-name Phase3Cube --new-name Phase3CubeCopy --location 2 0 0 --wait --timeout 120
+python -m arena_workshop create_material --material-name Phase3Material --object-name Phase3CubeCopy --base-color 0.8 0.3 0.1 1 --roughness 0.35 --metallic 0.7 --wait --timeout 120
+python -m arena_workshop capture_screenshot --width 640 --height 480 --wait --timeout 180
+python -m arena_workshop delete_object --object-name Phase3CubeCopy --wait --timeout 120
 ```
 
-The CLI validates modeling arguments before writing them to the mailbox. Protocol, mailbox, and fake-`bpy` operation tests run without Blender; they are not a substitute for running these commands with the real Blender 5.2 add-on.
+For visual iteration, read `screenshot_path` from the completed capture result, attach that PNG in the Arena conversation, request changes based on the visible result, submit the follow-up modeling job, and capture/attach another PNG. The CLI validates modeling and screenshot arguments before writing jobs to the mailbox. This local queue does not transfer image bytes to Arena automatically; the user must attach the PNG. Protocol, mailbox, and fake-`bpy` tests are not a substitute for running these commands with the real Blender 5.2 add-on.
 
 ## Current limitations
 
-- No Linear worker or Linear integration is included in this phase.
-- Automated operation tests use a small Blender API test double. Actual mesh/material behavior still requires the Windows Blender 5.2 runtime test above.
-- Primitive geometry uses fixed lightweight defaults; there are no arbitrary dimensions, modifiers, file saves, deletions, or general-purpose scripts.
+- No Linear worker or Linear integration is included.
+- Screenshot rendering uses the captured scene's active camera and current render engine; the camera view may need manual framing, and scenes without a linked camera fail cleanly. Render performance depends on the user's installed engine/device.
+- Screenshots are local files. Arena cannot fetch them automatically; manual PNG attachment is required for visual inspection.
+- `delete_object` is deliberately destructive for the named object. There is no arbitrary code, unrestricted operator, `.blend` save, or automatic scene cleanup.
+- Automated operations use a Blender API test double; real Blender 5.2 enable/render testing remains necessary for this screenshot implementation.
 
 ## Run tests and compilation checks
 

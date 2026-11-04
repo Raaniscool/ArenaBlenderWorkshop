@@ -33,6 +33,10 @@ SUPPORTED_OPERATIONS = (
     "scale_object",
     "rename_object",
     "create_material",
+    "capture_screenshot",
+    "duplicate_object",
+    "delete_object",
+    "set_dimensions",
 )
 PRIMITIVE_TYPES = {"cube", "uv_sphere", "cylinder", "plane", "cone"}
 MAX_OBJECT_NAME_LENGTH = 63
@@ -155,6 +159,39 @@ def _validate_params(operation, params):
         _validate_vector(params["base_color"], "base_color", size=4, minimum=0, maximum=1)
         for field in ("roughness", "metallic"):
             _validate_vector([params[field]], field, size=1, minimum=0, maximum=1)
+        return
+
+    if operation == "capture_screenshot":
+        if not set(params).issubset({"width", "height"}):
+            raise JobValidationError("invalid_capture_screenshot_parameters")
+        for field, maximum in (("width", 1280), ("height", 720)):
+            value = params.get(field, 640 if field == "width" else 480)
+            if isinstance(value, bool) or not isinstance(value, int) or not 64 <= value <= maximum:
+                raise JobValidationError("invalid_screenshot_" + field)
+        return
+
+    if operation == "duplicate_object":
+        if set(params) not in ({"object_name", "new_name"}, {"object_name", "new_name", "location"}):
+            raise JobValidationError("invalid_duplicate_object_parameters")
+        _validate_name(params["object_name"], "object_name")
+        _validate_name(params["new_name"], "new_name")
+        if params["object_name"] == params["new_name"]:
+            raise JobValidationError("duplicate_name_must_differ")
+        if "location" in params:
+            _validate_vector(params["location"], "location", minimum=-1_000_000, maximum=1_000_000)
+        return
+
+    if operation == "delete_object":
+        if set(params) != {"object_name"}:
+            raise JobValidationError("invalid_delete_object_parameters")
+        _validate_name(params["object_name"], "object_name")
+        return
+
+    if operation == "set_dimensions":
+        if set(params) != {"object_name", "dimensions"}:
+            raise JobValidationError("invalid_set_dimensions_parameters")
+        _validate_name(params["object_name"], "object_name")
+        _validate_vector(params["dimensions"], "dimensions", minimum=0.001, maximum=100_000)
         return
 
     raise JobValidationError("unsupported_operation")
