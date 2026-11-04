@@ -500,7 +500,7 @@ class DriveApi:
     def find_by_app_property(self, key, value, mime_type=None):
         escaped_key = key.replace("\\", "\\\\").replace("'", "\\'")
         escaped_value = value.replace("\\", "\\\\").replace("'", "\\'")
-        query = "appProperties has { key='{}' and value='{}' } and trashed = false".format(
+        query = "appProperties has {{ key='{}' and value='{}' }} and trashed = false".format(
             escaped_key, escaped_value,
         )
         if mime_type:

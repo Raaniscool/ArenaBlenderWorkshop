@@ -261,6 +261,18 @@ class DriveApiHttpTests(unittest.TestCase):
         self.assertIn(PNG, request.data)
         self.assertIn(b"job-1", request.data)
 
+    def test_app_property_query_escapes_literal_braces_and_key_value(self):
+        api = drive.DriveApi(oauth_config(), token_store=object())
+        with patch.object(api, "request_json", return_value={"files": []}) as request_mock:
+            files = api.find_by_app_property("job'key\\tail", "id'part\\end", "image/png")
+        self.assertEqual(files, [])
+        url = request_mock.call_args.args[1]
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["q"][0]
+        self.assertEqual(
+            query,
+            r"appProperties has { key='job\'key\\tail' and value='id\'part\\end' } and trashed = false and mimeType = 'image/png'",
+        )
+
 
 class FakeDriveApi:
     def __init__(self):
