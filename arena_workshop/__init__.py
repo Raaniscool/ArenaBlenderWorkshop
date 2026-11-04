@@ -88,26 +88,69 @@ def _poll_mailbox():
     return _POLL_SECONDS
 
 
+def _initialize_addon():
+    """Capture Blender data after registration restrictions have been lifted."""
+    global _mailbox, _startup_scene
+    if not _registered or _bpy is None:
+        return None
+
+    try:
+        if _startup_scene is None:
+            _startup_scene = resolve_startup_scene(_bpy)
+            if _startup_scene is None:
+                raise RuntimeError("Arena Blender Workshop could not find a startup scene")
+        if _mailbox is None:
+            _mailbox = FileMailbox(default_queue_root())
+        timers = _bpy.app.timers
+        if not timers.is_registered(_poll_mailbox):
+            timers.register(_poll_mailbox, first_interval=_POLL_SECONDS)
+    except Exception:
+        _LOG.exception("Arena Blender Workshop initialization is not ready; retrying")
+        return _POLL_SECONDS
+
+    _LOG.info("Arena Blender Workshop mailbox active at %s", _mailbox.root)
+    return None
+
+
+def _remove_timers(timers):
+    for callback in (_initialize_addon, _poll_mailbox):
+        if timers.is_registered(callback):
+            timers.unregister(callback)
+
+
 def register():
     global _bpy, _mailbox, _startup_scene, _registered
     import bpy
 
+    if _registered:
+        return
+
+    timers = bpy.app.timers
+    _remove_timers(timers)
+
     _bpy = bpy
-    _startup_scene = resolve_startup_scene(bpy)
-    if _startup_scene is None:
-        raise RuntimeError("Arena Blender Workshop could not find a startup scene")
-    _mailbox = FileMailbox(default_queue_root())
+    _mailbox = None
+    _startup_scene = None
     _registered = True
-    if not bpy.app.timers.is_registered(_poll_mailbox):
-        bpy.app.timers.register(_poll_mailbox, first_interval=_POLL_SECONDS)
-    _LOG.info("Arena Blender Workshop mailbox active at %s", _mailbox.root)
+    try:
+        timers.register(_initialize_addon, first_interval=_POLL_SECONDS)
+    except Exception:
+        _remove_timers(timers)
+        _registered = False
+        _mailbox = None
+        _startup_scene = None
+        _bpy = None
+        raise
 
 
 def unregister():
     global _registered, _mailbox, _startup_scene, _bpy
+    bpy = _bpy
     _registered = False
-    if _bpy is not None and _bpy.app.timers.is_registered(_poll_mailbox):
-        _bpy.app.timers.unregister(_poll_mailbox)
-    _mailbox = None
-    _startup_scene = None
-    _bpy = None
+    try:
+        if bpy is not None:
+            _remove_timers(bpy.app.timers)
+    finally:
+        _mailbox = None
+        _startup_scene = None
+        _bpy = None
