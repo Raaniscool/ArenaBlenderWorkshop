@@ -77,6 +77,27 @@ def wait_for_result(mailbox, job_id, timeout, poll_interval=_POLL_INTERVAL_SECON
         time.sleep(min(poll_interval, remaining))
 
 
+def _upload_completed_screenshot(result, mailbox, screenshot_root):
+    """Upload only the screenshot referenced by a completed capture job result."""
+    from .drive import screenshot_result_upload
+
+    operation_result = result.get("result") if isinstance(result, dict) else None
+    previous = operation_result.get("drive_upload") if isinstance(operation_result, dict) else None
+    if isinstance(previous, dict) and previous.get("status") == "uploaded":
+        return previous, True
+
+    upload_result = screenshot_result_upload(result, screenshot_root=screenshot_root)
+    if isinstance(operation_result, dict):
+        operation_result["drive_upload"] = upload_result
+    else:
+        result["drive_upload"] = upload_result
+    try:
+        mailbox.update_result(result)
+        return upload_result, True
+    except Exception:
+        return upload_result, False
+
+
 def _build_cli_parameters(args):
     params = {}
     if args.operation == "hello_test":
@@ -151,9 +172,28 @@ def main(argv=None):
         }, indent=2))
         return 2
 
+    upload_status = None
+    upload_recorded = True
+    if (args.operation == "capture_screenshot" and isinstance(result, dict)
+            and result.get("status") == "completed"):
+        upload_status, upload_recorded = _upload_completed_screenshot(
+            result, mailbox, mailbox.root / "screenshots",
+        )
+        if isinstance(result.get("result"), dict) and isinstance(upload_status, dict):
+            result["result"].setdefault("drive_upload", upload_status)
+        if not upload_recorded:
+            result["drive_upload_record_error"] = {
+                "code": "result_update_failed",
+                "message": "The PNG upload completed or failed, but its status could not be saved to the local mailbox result.",
+            }
+
     print(json.dumps(result, indent=2, ensure_ascii=False))
     if not isinstance(result, dict) or result.get("status") != "completed":
         return 1
+    if isinstance(upload_status, dict) and upload_status.get("status") != "uploaded":
+        return 3
+    if not upload_recorded:
+        return 3
     return 0
 
 

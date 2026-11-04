@@ -1,2 +1,10 @@
 __pycache__/
 *.py[cod]
+
+# Local Google OAuth client and protected token-store artifacts; never commit credentials.
+/google_oauth_client.json
+**/google_oauth_client.json
+/drive_tokens.dpapi
+**/drive_tokens.dpapi
+/token.json
+**/token.json

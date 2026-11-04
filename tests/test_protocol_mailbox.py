@@ -110,6 +110,19 @@ class MailboxTests(unittest.TestCase):
             mailbox.acknowledge(job["job_id"])
             self.assertIsNone(mailbox.read_result(job["job_id"]))
 
+    def test_update_result_atomically_adds_upload_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mailbox = FileMailbox(Path(tmp) / "queue")
+            result = {
+                "job_id": "result-update", "status": "completed",
+                "result": {"screenshot_path": "local.png"},
+            }
+            mailbox.write_result(result)
+            result["result"]["drive_upload"] = {"status": "uploaded", "file_id": "drive-id"}
+            mailbox.update_result(result)
+            self.assertEqual(mailbox.read_result("result-update"), result)
+            self.assertFalse(list(mailbox.results.glob("*.tmp")))
+
     def test_rejects_duplicate_job_id(self):
         with tempfile.TemporaryDirectory() as tmp:
             mailbox = FileMailbox(Path(tmp) / "queue")

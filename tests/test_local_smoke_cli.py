@@ -118,13 +118,33 @@ class CliWaitTests(unittest.TestCase):
             "job_id": "local-shot", "status": "completed",
             "result": {"screenshot_path": "queue/screenshots/local-shot.png"},
         }
-        exit_code = self.run_cli([
-            "capture_screenshot", "--width", "320", "--height", "240", "--wait",
-        ])
+        with patch.object(local_smoke, "_upload_completed_screenshot",
+                          return_value=({"status": "uploaded"}, True)) as upload_mock:
+            exit_code = self.run_cli([
+                "capture_screenshot", "--width", "320", "--height", "240", "--wait",
+            ])
         self.assertEqual(exit_code, 0)
+        upload_mock.assert_called_once()
         job = self.mailbox.enqueue.call_args.args[0]
         self.assertEqual(job["operation"], "capture_screenshot")
         self.assertEqual(job["parameters"], {"width": 320, "height": 240})
+
+    def test_screenshot_upload_failure_is_reported_without_changing_capture_success(self):
+        result = {
+            "job_id": "local-shot", "status": "completed",
+            "result": {"screenshot_path": "queue/screenshots/local-shot.png"},
+        }
+        self.mailbox.read_result.return_value = result
+        failure = {
+            "status": "failed", "job_id": "local-shot", "file_id": None,
+            "error": {"code": "authorization_required", "message": "Run authorize-drive."},
+        }
+        with patch.object(local_smoke, "_upload_completed_screenshot", return_value=(failure, True)):
+            exit_code = self.run_cli(["capture_screenshot", "--wait"])
+        output = json.loads(self.stdout.getvalue())
+        self.assertEqual(exit_code, 3)
+        self.assertEqual(output["status"], "completed")
+        self.assertEqual(output["result"]["drive_upload"]["error"]["code"], "authorization_required")
 
     def test_modeling_command_enqueues_validated_parameters(self):
         self.mailbox.read_result.return_value = {

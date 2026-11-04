@@ -104,6 +104,14 @@ class FileMailbox:
             return None
         return json.loads(path.read_text(encoding="utf-8"))
 
+    def update_result(self, result):
+        """Atomically update an existing result, e.g. with Drive upload metadata."""
+        job_id = self._job_id(result.get("job_id") if isinstance(result, dict) else None)
+        path = self.results / (job_id + ".json")
+        if not path.is_file():
+            raise FileNotFoundError(str(path))
+        self._atomic_json(path, result, overwrite=True)
+
     def acknowledge(self, job_id):
         """Remove local mailbox copies after the worker has durably reported results."""
         job_id = self._job_id(job_id)

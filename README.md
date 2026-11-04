@@ -35,9 +35,47 @@ Screenshots are retained at:
 %LOCALAPPDATA%\ArenaBlenderWorkshop\queue\screenshots\<job_id>.png
 ```
 
-The completed JSON result includes the absolute `screenshot_path`, scene/camera names, dimensions, render engine, byte size, format, and SHA-256. The mailbox is local to the Windows Blender/CLI user; it does **not** upload images to Arena. To let Arena inspect a result, attach the PNG from the returned path in the Arena conversation. This manual attachment is currently required; the repository has no authenticated screenshot-transfer service.
+The completed JSON result includes the absolute `screenshot_path`, scene/camera names, dimensions, render engine, byte size, format, and SHA-256. The mailbox remains local to the Windows Blender/CLI user. The uploader described below can send only the PNG produced for a completed `capture_screenshot` job; it does not upload projects or unrelated files.
 
-Iterate visually by submitting a modeling job, waiting for its result, attaching the returned PNG for review, then submitting a follow-up job (for example `move_object`, `set_dimensions`, or `create_material`) and capturing another screenshot. `duplicate_object` is restricted to mesh objects and copies mesh data. `delete_object` is intentionally explicit and irreversible through this add-on; use it only for a named object you intend to remove.
+Iterate locally by submitting a modeling job, waiting for its result, then submitting a follow-up job (for example `move_object`, `set_dimensions`, or `create_material`) and capturing another screenshot. `duplicate_object` is restricted to mesh objects and copies mesh data. `delete_object` is intentionally explicit and irreversible through this add-on; use it only for a named object you intend to remove.
+
+### Google Drive screenshot transfer (Windows)
+
+The optional local uploader uses the Windows user's own Google OAuth identity. It does not use Arena's Google Drive connector authorization and does not create a public listener. The OAuth file is read locally at runtime and is never part of the repository:
+
+```text
+google_oauth_client.json
+```
+
+Place the Google Cloud **Desktop app** OAuth JSON at the repository root under that exact name. `.gitignore` excludes it. Do not paste its contents or any token into Arena. On the first setup, run this from PowerShell in the repository root:
+
+```powershell
+python -m arena_workshop authorize-drive
+```
+
+This validates the Installed OAuth JSON, opens Google's authorization page in your browser, and requests only the `drive.file` scope. Choose the same Google account that Arena's Drive connector can access, review and explicitly approve the requested access, then allow the browser to return to the local loopback callback. If the Google consent screen is in Testing, the account may also need to be listed as a test user. The flow uses PKCE and a temporary `127.0.0.1` callback; the authorization code is handled locally. No code or token needs to be copied. The refresh token is DPAPI-protected for the current Windows user at:
+
+```text
+%LOCALAPPDATA%\ArenaBlenderWorkshop\drive_tokens.dpapi
+```
+
+There is no plaintext fallback. If Windows-protected storage is unavailable, authorization fails instead of writing a plaintext token. Re-run `authorize-drive` if consent was denied, revoked, or the refresh token is no longer accepted.
+
+When the add-on has completed a screenshot job and the CLI is waiting for its result, the PNG upload happens automatically:
+
+```powershell
+python -m arena_workshop capture_screenshot --wait --timeout 180
+```
+
+The upload creates or reuses an app-owned Drive folder named **ArenaBlenderWorkshop Screenshots** and stores the PNG there. The Drive filename contains the job ID (`arena-blender-<job_id>.png`); the file description and app-private metadata also associate it with that job. A repeated upload of the same job and identical PNG reuses the existing Drive file; if the same job ID is associated with different image bytes, it fails rather than creating another file. Uploads are limited to 20 MiB and retry transient network/service failures up to three attempts. The local screenshot is never deleted when an upload succeeds or fails.
+
+The completed mailbox result retains the screenshot metadata and adds `result.drive_upload` with status, Drive file ID, filename, MIME type, and retrieval reference, or a structured error. To upload/retry a previously completed screenshot, use:
+
+```powershell
+python -m arena_workshop upload-screenshot --job-id <job_id>
+```
+
+The existing immediate-return CLI behavior is unchanged: without `--wait`, it prints the job ID and exits before Blender has produced a result, so that invocation cannot upload automatically. Use `upload-screenshot` after the result exists. The local queue still does not let a remote Arena session submit jobs to Windows; this feature only handles local screenshot results. A successful Drive upload is not itself proof that Arena retrieved or visually inspected the image. The Drive file must be retrieved and inspected separately through the connected Arena integration.
 
 ## One-command Blender 5.2 add-on install and update (Windows)
 
@@ -71,7 +109,7 @@ Backups are stored under `%LOCALAPPDATA%\ArenaBlenderWorkshop\addon-backups\aren
 
 ## Local CLI and Windows tests
 
-Run commands from the repository root in PowerShell while Blender 5.2 is open with the add-on enabled. The CLI exposes only the allowlisted operations. `--wait` polls the result for that single enqueued job; it does not resubmit. Default timeout is 60 seconds; `--timeout SECONDS` changes it. Exit codes: `0` completed, `1` failed/unexpected result, `2` timed out. Omitting `--wait` keeps the previous behavior of printing the job ID and result path immediately.
+Run commands from the repository root in PowerShell while Blender 5.2 is open with the add-on enabled. The CLI exposes only the allowlisted operations. `--wait` polls the result for that single enqueued job; it does not resubmit. Default timeout is 60 seconds; `--timeout SECONDS` changes it. Exit codes: `0` completed (including successful upload), `1` failed/unexpected Blender result, `2` timed out, `3` screenshot upload or upload-result persistence failed. A Drive upload failure does not remove the screenshot or mark a successful Blender capture as failed; its separate `result.drive_upload` object contains the error. Omitting `--wait` keeps the previous behavior of printing the job ID and result path immediately.
 
 ### Compact Blender 5.2 verification (PowerShell)
 
@@ -127,13 +165,13 @@ finally {
 }
 ```
 
-Each successful call prints structured JSON. Check the `screenshot_path` in both capture results; the original `Cube` is not targeted by this workflow. The test checks the existing CLI/API results and adds a fake-`bpy` sequential workflow regression, but **does not replace executing this procedure in Blender 5.2**. For Arena visual review, manually attach a PNG from the reported local path; the queue does not upload image bytes.
+Each successful call prints structured JSON. Check the `screenshot_path` in both capture results; the original `Cube` is not targeted by this workflow. The test checks the existing CLI/API results and adds a fake-`bpy` sequential workflow regression, but **does not replace executing this procedure in Blender 5.2**. If local Drive authorization is configured, a waited screenshot job automatically reports its Drive upload status and file ID as well as its local path; this documentation does not claim a real Windows/Blender upload was tested.
 
 ## Current limitations
 
 - No Linear worker or Linear integration is included.
 - Screenshot rendering uses the captured scene's active camera and current render engine; the camera view may need manual framing, and scenes without a linked camera fail cleanly. Render performance depends on the user's installed engine/device.
-- Screenshots are local files. Arena cannot fetch them automatically; manual PNG attachment is required for visual inspection.
+- Screenshots are always retained locally. When the local Windows user authorizes Drive, the CLI can upload a screenshot and record its Drive file ID; Arena retrieval and actual visual inspection remain separate and must be verified independently.
 - `delete_object` is deliberately destructive for the named object. There is no arbitrary code, unrestricted operator, `.blend` save, or automatic scene cleanup.
 - Automated operations use a Blender API test double; real Blender 5.2 enable/render testing remains necessary for this screenshot implementation.
 
