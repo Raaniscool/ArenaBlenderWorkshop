@@ -2,14 +2,14 @@
 
 A local Blender connector using a strict JSON protocol and an atomic file mailbox. The Blender add-on polls the mailbox using a Blender application timer and runs the fixed operation allowlist on Blender's main thread. The bridge opens no network listener and does not use arbitrary Python, shell commands, or unrestricted Blender operators.
 
-## Phase 3A: basic modeling operations
+## Phase 3A.1: basic modeling operations in the startup scene
 
 The protocol remains version `1.0`; previous `hello_test` and `create_test_object` jobs continue to work. The current allowlist is:
 
 | Operation | Required parameters | Optional parameters / behavior |
 | --- | --- | --- |
-| `hello_test` | `message` | Reports Blender version and current scene. |
-| `create_test_object` | none | Creates or detects the fixed `ArenaWorkshopTestCube`. |
+| `hello_test` | `message` | Reports Blender version and the active scene (which may differ from the modeling target). |
+| `create_test_object` | none | Creates or detects the fixed `ArenaWorkshopTestCube` in the captured startup scene. |
 | `create_primitive` | `primitive_type`, `object_name` | Optional `location`, `rotation`, `scale`; types: `cube`, `uv_sphere`, `cylinder`, `plane`, `cone`. |
 | `move_object` | `object_name`, `location` | Sets the object's location. |
 | `rotate_object` | `object_name`, `rotation` | Sets Euler rotation in degrees (converted to Blender radians). |
@@ -19,7 +19,7 @@ The protocol remains version `1.0`; previous `hello_test` and `create_test_objec
 
 Vectors are three numeric values except `base_color`, which has four. Location, rotation, scale, color, roughness, and metallic are range-checked; object/material names are bounded and checked. Unknown fields and operations are rejected. Name conflicts and missing targets return structured failure results rather than replacing objects or materials.
 
-Modeling operations target only `ArenaWorkshopTest`. It is created if needed, without switching Blender's active scene. Unrelated existing objects and materials are never deleted or replaced; only the explicitly named target object is transformed, renamed, or assigned a newly created material. Creating a primitive with a retried job ID is idempotent; a different job cannot silently replace an object with the same name. Transforms are assignments and can be retried safely. No operation saves or overwrites the `.blend` file.
+At add-on registration, the target is resolved to Blender's existing normal startup scene (normally `Scene`, containing the original `Cube`) and retained for every job, even if the user later switches the active scene. Jobs do not create a separate scene or change the active scene. Newly created objects are linked to that startup scene. The original cube and unrelated existing objects and materials are preserved; only an explicitly named object is transformed, renamed, or assigned a newly created material. Modeling results report the actual target scene name. Creating a primitive with a retried job ID is idempotent; a different job cannot silently replace an object with the same name. Transforms are assignments and can be retried safely. No operation saves or overwrites the `.blend` file.
 
 ## Install or update the add-on in Blender 5.2 on Windows
 

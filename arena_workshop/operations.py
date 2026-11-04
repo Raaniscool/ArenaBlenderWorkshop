@@ -7,8 +7,9 @@ from math import cos, pi, sin
 
 from .protocol import JobValidationError
 
-TEST_SCENE = "ArenaWorkshopTest"
-TEST_OBJECT = "ArenaWorkshopTestCube"
+DEFAULT_SCENE_NAME = "Scene"
+DEFAULT_CUBE_NAME = "Cube"
+SMOKE_TEST_OBJECT = "ArenaWorkshopTestCube"
 _TAG_OPERATION = "arena_workshop_operation"
 _TAG_JOB_ID = "arena_workshop_job_id"
 _TAG_FINGERPRINT = "arena_workshop_fingerprint"
@@ -21,6 +22,35 @@ class OperationError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+def resolve_startup_scene(bpy):
+    """Resolve the normal startup scene once, preferring its original default cube."""
+    scenes = list(bpy.data.scenes)
+    named_startup = bpy.data.scenes.get(DEFAULT_SCENE_NAME)
+    if named_startup is not None and named_startup.objects.get(DEFAULT_CUBE_NAME) is not None:
+        return named_startup
+
+    cube_scenes = [scene for scene in scenes
+                   if scene.objects.get(DEFAULT_CUBE_NAME) is not None]
+    if len(cube_scenes) == 1:
+        return cube_scenes[0]
+
+    active_scene = getattr(getattr(bpy, "context", None), "scene", None)
+    if active_scene is not None and any(scene.name == active_scene.name for scene in cube_scenes):
+        return active_scene
+    if named_startup is not None:
+        return named_startup
+    if active_scene is not None:
+        return active_scene
+    return scenes[0] if scenes else None
+
+
+def _target_scene(bpy, startup_scene=None):
+    scene = startup_scene if startup_scene is not None else resolve_startup_scene(bpy)
+    if scene is None:
+        raise OperationError("startup_scene_unavailable", "No Blender scene is available for modeling.")
+    return scene
 
 
 def _fingerprint(job):
@@ -52,19 +82,12 @@ def _tag(datablock, job):
     datablock[_TAG_FINGERPRINT] = _fingerprint(job)
 
 
-def _get_test_scene(bpy):
-    scene = bpy.data.scenes.get(TEST_SCENE)
-    if scene is None:
-        scene = bpy.data.scenes.new(TEST_SCENE)
-    return scene
-
-
 def _find_object(scene, name):
     obj = scene.objects.get(name)
     if obj is None:
         raise OperationError(
             "object_not_found",
-            "Object {!r} was not found in scene {}.".format(name, TEST_SCENE),
+            "Object {!r} was not found in scene {}.".format(name, scene.name),
         )
     return obj
 
@@ -180,10 +203,10 @@ def _new_mesh_object(bpy, scene, name, primitive_type):
         ) from exc
 
 
-def _test_object_result(obj, mesh, created):
+def _test_object_result(obj, mesh, created, scene):
     result = {
         "object_name": obj.name,
-        "scene_name": TEST_SCENE,
+        "scene_name": scene.name,
         "created": created,
     }
     if created:
@@ -194,31 +217,28 @@ def _test_object_result(obj, mesh, created):
     return result
 
 
-def _create_test_object(bpy):
-    scene = _get_test_scene(bpy)
-    existing = scene.objects.get(TEST_OBJECT)
+def _create_test_object(bpy, scene):
+    existing = scene.objects.get(SMOKE_TEST_OBJECT)
     if existing is not None:
-        mesh = existing.data
-        return _test_object_result(existing, mesh, False)
-    if bpy.data.objects.get(TEST_OBJECT) is not None:
+        return _test_object_result(existing, existing.data, False, scene)
+    if bpy.data.objects.get(SMOKE_TEST_OBJECT) is not None:
         raise OperationError(
             "object_name_conflict",
-            "An object named {} already exists outside the test scene.".format(TEST_OBJECT),
+            "An object named {} already exists outside scene {}.".format(SMOKE_TEST_OBJECT, scene.name),
         )
-    obj, mesh = _new_mesh_object(bpy, scene, TEST_OBJECT, "cube")
-    return _test_object_result(obj, mesh, True)
+    obj, mesh = _new_mesh_object(bpy, scene, SMOKE_TEST_OBJECT, "cube")
+    return _test_object_result(obj, mesh, True, scene)
 
 
-def _create_primitive(bpy, job):
+def _create_primitive(bpy, job, scene):
     params = job["parameters"]
-    scene = _get_test_scene(bpy)
     existing = bpy.data.objects.get(params["object_name"])
     if existing is not None:
         existing_in_scene = scene.objects.get(params["object_name"])
         if existing_in_scene is not None and _retry_matches(existing_in_scene, job):
             return {
                 "object_name": existing_in_scene.name,
-                "scene_name": TEST_SCENE,
+                "scene_name": scene.name,
                 "primitive_type": params["primitive_type"],
                 "created": False,
                 "message": "This job already created the object; no duplicate was made.",
@@ -243,7 +263,7 @@ def _create_primitive(bpy, job):
         ) from exc
     return {
         "object_name": obj.name,
-        "scene_name": TEST_SCENE,
+        "scene_name": scene.name,
         "primitive_type": params["primitive_type"],
         "created": True,
         "location": list(params.get("location", (0.0, 0.0, 0.0))),
@@ -254,9 +274,9 @@ def _create_primitive(bpy, job):
     }
 
 
-def _transform_object(bpy, job):
+def _transform_object(job, scene):
     params = job["parameters"]
-    obj = _find_object(_get_test_scene(bpy), params["object_name"])
+    obj = _find_object(scene, params["object_name"])
     operation = job["operation"]
     if operation == "move_object":
         values = tuple(float(value) for value in params["location"])
@@ -273,15 +293,14 @@ def _transform_object(bpy, job):
         result_field = "scale"
     return {
         "object_name": obj.name,
-        "scene_name": TEST_SCENE,
+        "scene_name": scene.name,
         result_field: list(values),
         "updated": True,
     }
 
 
-def _rename_object(bpy, job):
+def _rename_object(bpy, job, scene):
     params = job["parameters"]
-    scene = _get_test_scene(bpy)
     old_name = params["object_name"]
     new_name = params["new_name"]
     obj = scene.objects.get(old_name)
@@ -289,14 +308,14 @@ def _rename_object(bpy, job):
         renamed = scene.objects.get(new_name)
         if renamed is not None and _retry_matches(renamed, job):
             return {"old_name": old_name, "object_name": new_name,
-                    "scene_name": TEST_SCENE, "renamed": False}
+                    "scene_name": scene.name, "renamed": False}
         raise OperationError(
             "object_not_found",
-            "Object {!r} was not found in scene {}.".format(old_name, TEST_SCENE),
+            "Object {!r} was not found in scene {}.".format(old_name, scene.name),
         )
     if old_name == new_name:
         return {"old_name": old_name, "object_name": new_name,
-                "scene_name": TEST_SCENE, "renamed": False}
+                "scene_name": scene.name, "renamed": False}
     collision = bpy.data.objects.get(new_name)
     if collision is not None:
         raise OperationError(
@@ -316,7 +335,7 @@ def _rename_object(bpy, job):
             "Blender could not rename the object ({}).".format(type(exc).__name__),
         ) from exc
     return {"old_name": old_name, "object_name": new_name,
-            "scene_name": TEST_SCENE, "renamed": True}
+            "scene_name": scene.name, "renamed": True}
 
 
 def _set_principled(material, color, roughness, metallic):
@@ -343,9 +362,8 @@ def _set_principled(material, color, roughness, metallic):
             socket.default_value = value
 
 
-def _create_material(bpy, job):
+def _create_material(bpy, job, scene):
     params = job["parameters"]
-    scene = _get_test_scene(bpy)
     obj = _find_object(scene, params["object_name"])
     slots = getattr(obj.data, "materials", None)
     if slots is None:
@@ -391,7 +409,7 @@ def _create_material(bpy, job):
     return {
         "material_name": material.name,
         "object_name": obj.name,
-        "scene_name": TEST_SCENE,
+        "scene_name": scene.name,
         "base_color": list(params["base_color"]),
         "roughness": params["roughness"],
         "metallic": params["metallic"],
@@ -400,8 +418,8 @@ def _create_material(bpy, job):
     }
 
 
-def execute_job(bpy, job):
-    """Execute one already-validated job using Blender's data API only."""
+def execute_job(bpy, job, startup_scene=None):
+    """Execute one validated job using Blender's data API only."""
     operation = job["operation"]
     params = job["parameters"]
     if operation == "hello_test":
@@ -411,14 +429,16 @@ def execute_job(bpy, job):
             "blender_version": bpy.app.version_string,
             "active_scene": active_scene.name if active_scene else None,
         }
+
+    scene = _target_scene(bpy, startup_scene)
     if operation == "create_test_object":
-        return _create_test_object(bpy)
+        return _create_test_object(bpy, scene)
     if operation == "create_primitive":
-        return _create_primitive(bpy, job)
+        return _create_primitive(bpy, job, scene)
     if operation in {"move_object", "rotate_object", "scale_object"}:
-        return _transform_object(bpy, job)
+        return _transform_object(job, scene)
     if operation == "rename_object":
-        return _rename_object(bpy, job)
+        return _rename_object(bpy, job, scene)
     if operation == "create_material":
-        return _create_material(bpy, job)
+        return _create_material(bpy, job, scene)
     raise JobValidationError("unsupported_operation")

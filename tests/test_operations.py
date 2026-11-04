@@ -3,10 +3,10 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from arena_workshop.operations import (
-    TEST_OBJECT,
-    TEST_SCENE,
+    SMOKE_TEST_OBJECT,
     OperationError,
     execute_job,
+    resolve_startup_scene,
 )
 from arena_workshop.protocol import JobValidationError, validate_job
 
@@ -141,6 +141,9 @@ class FakeScene:
 
 
 class FakeScenes(dict):
+    def __iter__(self):
+        return iter(self.values())
+
     def new(self, name):
         if name in self:
             raise ValueError("scene exists")
@@ -189,14 +192,27 @@ class FakeMeshes(dict):
 class FakeBpy:
     def __init__(self):
         scenes = FakeScenes()
-        active_scene = scenes.new("UserScene")
+        startup_scene = scenes.new("Scene")
+        switched_scene = scenes.new("SwitchedScene")
         objects = FakeObjects()
         self.data = type("FakeData", (), {})()
         self.data.scenes = scenes
         self.data.objects = objects
         self.data.meshes = FakeMeshes()
         self.data.materials = FakeMaterials()
-        self.context = type("FakeContext", (), {"scene": active_scene})()
+        cube_mesh = self.data.meshes.new("CubeMesh")
+        cube_mesh.from_pydata(
+            [(-1, -1, -1), (1, -1, -1), (1, 1, -1), (-1, 1, -1),
+             (-1, -1, 1), (1, -1, 1), (1, 1, 1), (-1, 1, 1)],
+            [],
+            [(0, 1, 2, 3), (4, 7, 6, 5), (0, 4, 5, 1),
+             (1, 5, 6, 2), (2, 6, 7, 3), (4, 0, 3, 7)],
+        )
+        self.default_cube = self.data.objects.new("Cube", cube_mesh)
+        startup_scene.collection.objects.link(self.default_cube)
+        self.startup_scene = startup_scene
+        self.switched_scene = switched_scene
+        self.context = type("FakeContext", (), {"scene": startup_scene})()
         self.app = type("FakeApp", (), {"version_string": "5.2.0 test fake"})()
 
 
@@ -291,10 +307,13 @@ class ModelingOperationTests(unittest.TestCase):
     def setUp(self):
         self.bpy = FakeBpy()
         self.active_scene = self.bpy.context.scene
+        self.startup_scene = resolve_startup_scene(self.bpy)
+        self.original_cube = self.bpy.default_cube
+        self.original_cube_mesh = self.original_cube.data
 
-    def run_job(self, operation, parameters, job_id="job-001"):
+    def run_job(self, operation, parameters, job_id="job-001", startup_scene=None):
         job = validated(make_job(operation, parameters, job_id=job_id))
-        return execute_job(self.bpy, job)
+        return execute_job(self.bpy, job, startup_scene=startup_scene)
 
     def test_create_each_primitive_with_expected_mesh(self):
         expected = {
@@ -308,14 +327,17 @@ class ModelingOperationTests(unittest.TestCase):
             with self.subTest(primitive_type=primitive_type):
                 result = self.run_job(
                     "create_primitive",
-                    {"primitive_type": primitive_type, "object_name": primitive_type.title()},
+                    {"primitive_type": primitive_type, "object_name": "Created" + primitive_type.title()},
                     job_id="primitive-" + primitive_type,
                 )
                 obj = self.bpy.data.objects[result["object_name"]]
                 self.assertEqual((len(obj.data.vertices), len(obj.data.polygons)), counts)
-                self.assertEqual(result["scene_name"], TEST_SCENE)
+                self.assertEqual(result["scene_name"], self.startup_scene.name)
+                self.assertIs(self.startup_scene.objects.get(result["object_name"]), obj)
                 self.assertTrue(result["created"])
                 self.assertIs(self.bpy.context.scene, self.active_scene)
+                self.assertIs(self.bpy.data.objects["Cube"], self.original_cube)
+                self.assertIs(self.original_cube.data, self.original_cube_mesh)
 
     def test_primitive_transforms_and_retry_are_idempotent(self):
         params = {
@@ -341,57 +363,87 @@ class ModelingOperationTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "object_name_conflict")
         self.assertIs(self.bpy.data.objects["Protected"], original)
 
-    def test_create_test_object_remains_idempotent(self):
+    def test_create_test_object_remains_idempotent_and_preserves_default_cube(self):
         first = self.run_job("create_test_object", {})
         second = self.run_job("create_test_object", {}, job_id="different-job")
         self.assertTrue(first["created"])
         self.assertFalse(second["created"])
-        self.assertEqual(len(self.bpy.data.objects), 1)
+        self.assertEqual(len(self.bpy.data.objects), 2)
+        self.assertIs(self.bpy.data.objects["Cube"], self.original_cube)
+        self.assertIs(self.startup_scene.objects.get(SMOKE_TEST_OBJECT), self.bpy.data.objects[SMOKE_TEST_OBJECT])
 
-    def test_transforms_change_only_named_test_scene_object(self):
+    def test_transforms_change_only_named_startup_scene_object(self):
+        unrelated = self.bpy.data.objects.new("Unrelated", FakeMesh("UnrelatedMesh"))
+        self.startup_scene.collection.objects.link(unrelated)
         created = self.run_job("create_test_object", {})
         target = self.bpy.data.objects[created["object_name"]]
-        self.run_job("move_object", {"object_name": TEST_OBJECT, "location": [3, 2, 1]}, "move-1")
-        self.run_job("rotate_object", {"object_name": TEST_OBJECT, "rotation": [0, 0, 180]}, "rotate-1")
-        self.run_job("scale_object", {"object_name": TEST_OBJECT, "scale": [2, 2, 2]}, "scale-1")
+        move_result = self.run_job("move_object", {"object_name": SMOKE_TEST_OBJECT, "location": [3, 2, 1]}, "move-1")
+        self.run_job("rotate_object", {"object_name": SMOKE_TEST_OBJECT, "rotation": [0, 0, 180]}, "rotate-1")
+        self.run_job("scale_object", {"object_name": SMOKE_TEST_OBJECT, "scale": [2, 2, 2]}, "scale-1")
+        self.assertEqual(move_result["scene_name"], self.startup_scene.name)
         self.assertEqual(target.location, (3.0, 2.0, 1.0))
         self.assertAlmostEqual(target.rotation_euler[2], math.pi)
         self.assertEqual(target.scale, (2.0, 2.0, 2.0))
+        self.assertEqual(self.original_cube.location, (0.0, 0.0, 0.0))
+        self.assertEqual(self.original_cube.rotation_euler, (0.0, 0.0, 0.0))
+        self.assertEqual(self.original_cube.scale, (1.0, 1.0, 1.0))
+        self.assertEqual(unrelated.location, (0.0, 0.0, 0.0))
+        self.assertEqual(unrelated.rotation_euler, (0.0, 0.0, 0.0))
+        self.assertEqual(unrelated.scale, (1.0, 1.0, 1.0))
         self.assertIs(self.bpy.context.scene, self.active_scene)
+
+    def test_captured_startup_scene_is_used_after_active_scene_switch(self):
+        self.bpy.context.scene = self.bpy.switched_scene
+        self.assertIs(resolve_startup_scene(self.bpy), self.startup_scene)
+        result = self.run_job(
+            "create_primitive",
+            {"primitive_type": "cube", "object_name": "StartupTarget"},
+            startup_scene=self.startup_scene,
+        )
+        target = self.bpy.data.objects["StartupTarget"]
+        self.assertEqual(result["scene_name"], "Scene")
+        self.assertIs(self.startup_scene.objects.get("StartupTarget"), target)
+        self.assertIsNone(self.bpy.switched_scene.objects.get("StartupTarget"))
+        self.assertIs(self.bpy.context.scene, self.bpy.switched_scene)
+        self.assertIs(self.bpy.data.objects["Cube"], self.original_cube)
 
     def test_rename_updates_same_object_and_retry_does_not_duplicate(self):
         self.run_job("create_test_object", {})
-        original = self.bpy.data.objects[TEST_OBJECT]
-        params = {"object_name": TEST_OBJECT, "new_name": "RenamedCube"}
+        original = self.bpy.data.objects[SMOKE_TEST_OBJECT]
+        params = {"object_name": SMOKE_TEST_OBJECT, "new_name": "RenamedCube"}
         first = self.run_job("rename_object", params, "rename-1")
         second = self.run_job("rename_object", params, "rename-1")
         self.assertTrue(first["renamed"])
+        self.assertEqual(first["scene_name"], self.startup_scene.name)
         self.assertFalse(second["renamed"])
         self.assertIs(self.bpy.data.objects["RenamedCube"], original)
-        self.assertNotIn(TEST_OBJECT, self.bpy.data.objects)
+        self.assertIs(self.startup_scene.objects.get("RenamedCube"), original)
+        self.assertNotIn(SMOKE_TEST_OBJECT, self.bpy.data.objects)
+        self.assertIs(self.bpy.data.objects["Cube"], self.original_cube)
 
     def test_rename_conflict_does_not_replace_target(self):
         self.run_job("create_test_object", {})
-        original = self.bpy.data.objects[TEST_OBJECT]
+        original = self.bpy.data.objects[SMOKE_TEST_OBJECT]
         collision = self.bpy.data.objects.new("TakenName", FakeMesh("TakenMesh"))
         with self.assertRaises(OperationError) as caught:
-            self.run_job("rename_object", {"object_name": TEST_OBJECT, "new_name": "TakenName"})
+            self.run_job("rename_object", {"object_name": SMOKE_TEST_OBJECT, "new_name": "TakenName"})
         self.assertEqual(caught.exception.code, "object_name_conflict")
-        self.assertIs(self.bpy.data.objects[TEST_OBJECT], original)
+        self.assertIs(self.bpy.data.objects[SMOKE_TEST_OBJECT], original)
         self.assertIs(self.bpy.data.objects["TakenName"], collision)
 
     def test_material_creation_assignment_and_retry(self):
         self.run_job("create_test_object", {})
         params = {
-            "material_name": "WarmMetal", "object_name": TEST_OBJECT,
+            "material_name": "WarmMetal", "object_name": SMOKE_TEST_OBJECT,
             "base_color": [0.8, 0.3, 0.1, 1.0], "roughness": 0.35, "metallic": 0.7,
         }
         first = self.run_job("create_material", params, "material-1")
-        obj = self.bpy.data.objects[TEST_OBJECT]
+        obj = self.bpy.data.objects[SMOKE_TEST_OBJECT]
         material = self.bpy.data.materials["WarmMetal"]
         second = self.run_job("create_material", params, "material-1")
         self.assertTrue(first["created"])
         self.assertTrue(first["assigned"])
+        self.assertEqual(first["scene_name"], self.startup_scene.name)
         self.assertFalse(second["created"])
         self.assertEqual(obj.data.materials, [material])
         self.assertEqual(material.diffuse_color, tuple(params["base_color"]))
@@ -404,7 +456,7 @@ class ModelingOperationTests(unittest.TestCase):
         original.diffuse_color = (0.1, 0.2, 0.3, 1.0)
         self.bpy.data.materials[original.name] = original
         params = {
-            "material_name": "ProtectedMaterial", "object_name": TEST_OBJECT,
+            "material_name": "ProtectedMaterial", "object_name": SMOKE_TEST_OBJECT,
             "base_color": [0.8, 0.8, 0.8, 1.0], "roughness": 0.2, "metallic": 0.5,
         }
         with self.assertRaises(OperationError) as caught:

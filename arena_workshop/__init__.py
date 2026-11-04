@@ -18,12 +18,13 @@ import logging
 from datetime import datetime, timezone
 
 from .mailbox import FileMailbox, default_queue_root
-from .operations import OperationError, execute_job
+from .operations import OperationError, execute_job, resolve_startup_scene
 
 _LOG = logging.getLogger("arena_blender_workshop")
 _POLL_SECONDS = 0.5
 _bpy = None
 _mailbox = None
+_startup_scene = None
 _registered = False
 
 
@@ -32,7 +33,7 @@ def _utc_now():
 
 
 def _execute(job):
-    return execute_job(_bpy, job)
+    return execute_job(_bpy, job, startup_scene=_startup_scene)
 
 
 def _failure_response(job, code, message):
@@ -88,10 +89,13 @@ def _poll_mailbox():
 
 
 def register():
-    global _bpy, _mailbox, _registered
+    global _bpy, _mailbox, _startup_scene, _registered
     import bpy
 
     _bpy = bpy
+    _startup_scene = resolve_startup_scene(bpy)
+    if _startup_scene is None:
+        raise RuntimeError("Arena Blender Workshop could not find a startup scene")
     _mailbox = FileMailbox(default_queue_root())
     _registered = True
     if not bpy.app.timers.is_registered(_poll_mailbox):
@@ -100,9 +104,10 @@ def register():
 
 
 def unregister():
-    global _registered, _mailbox, _bpy
+    global _registered, _mailbox, _startup_scene, _bpy
     _registered = False
     if _bpy is not None and _bpy.app.timers.is_registered(_poll_mailbox):
         _bpy.app.timers.unregister(_poll_mailbox)
     _mailbox = None
+    _startup_scene = None
     _bpy = None
