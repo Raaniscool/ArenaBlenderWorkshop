@@ -39,25 +39,35 @@ The completed JSON result includes the absolute `screenshot_path`, scene/camera 
 
 Iterate visually by submitting a modeling job, waiting for its result, attaching the returned PNG for review, then submitting a follow-up job (for example `move_object`, `set_dimensions`, or `create_material`) and capturing another screenshot. `duplicate_object` is restricted to mesh objects and copies mesh data. `delete_object` is intentionally explicit and irreversible through this add-on; use it only for a named object you intend to remove.
 
-## Install or update the add-on in Blender 5.2 on Windows
+## One-command Blender 5.2 add-on install and update (Windows)
 
-This is a legacy add-on package (`bl_info` in `arena_workshop/__init__.py`). Its expected per-user folder is:
+The repository includes `update_blender_addon.ps1`. It uses the Python standard library and Git already required by this project; it does not download Blender, need administrator access, or restart Blender. The install location is `%APPDATA%\Blender Foundation\Blender\5.2\scripts\addons\arena_workshop`.
 
-```text
-%APPDATA%\Blender Foundation\Blender\5.2\scripts\addons\arena_workshop\
+### Initial setup
+
+1. Install Git for Windows and Python (the same `python` command used for the CLI). For a fresh checkout, run `git clone --branch arena/aadcacbd-arenablenderworkshop --single-branch https://github.com/Raaniscool/ArenaBlenderWorkshop.git C:\Users\Raani\Documents\ArenaBlenderWorkshop`. If already cloned, confirm the checkout is on `arena/aadcacbd-arenablenderworkshop`.
+2. Ensure the checkout is clean. Close Blender normally.
+3. From the repository directory, run:
+
+   ```powershell
+   .\update_blender_addon.ps1
+   ```
+
+   On first install the script creates missing Blender `scripts\addons` directories and installs the package. Start Blender and enable **Arena Blender Workshop MVP** once in **Edit → Preferences → Add-ons**.
+
+### Updating later
+
+Close Blender normally, open PowerShell in the repository directory, and run the same one command:
+
+```powershell
+.\update_blender_addon.ps1
 ```
 
-The installed package must include `__init__.py`, `mailbox.py`, `protocol.py`, and **`operations.py`**.
+The updater verifies the repository and exact expected branch, refuses uncommitted or untracked changes, checks for running `blender.exe` / `blender-launcher.exe` processes, runs `git pull --ff-only`, stages and verifies the add-on, backs up any current install, and replaces only the `arena_workshop` package. It reports the pulled commit, install path, and backup path. Existing backups are never automatically deleted. Blender preferences, other add-ons, mailbox contents, and `.blend` projects are not touched.
 
-1. Close Blender 5.2. In File Explorer, enter `%APPDATA%\Blender Foundation\Blender\5.2\scripts\addons` in the address bar; create the missing `scripts\addons` folders if necessary.
-2. For a new install, copy the repository's whole `arena_workshop` folder into `addons`.
-3. To update the earlier Phase 2A install, first copy the existing installed `arena_workshop` folder to a separate backup location. Then replace its contents with the repository's current `arena_workshop` folder. Do not overwrite the old copy before making that backup; do not replace any other add-on folder.
-4. Start Blender 5.2. Open **Edit → Preferences → Add-ons**, search **Arena Blender Workshop MVP**, and enable it. If Blender does not list it, check the path and ensure `arena_workshop\__init__.py` is directly inside the package folder.
-5. Keep Blender open with the add-on enabled while sending jobs. The add-on timer runs inside Blender. Run the CLI as the same Windows user so it uses the same `%LOCALAPPDATA%\ArenaBlenderWorkshop\queue` mailbox.
+If Blender is running, the updater stops before pulling or installing; close Blender using **File → Quit** or its normal window close, then rerun the command. It never force-stops or restarts Blender. A dirty checkout or a different branch also stops safely; save/commit or move the local changes elsewhere, then rerun from the expected branch. Git pull failures leave the installed add-on unchanged.
 
-A completed `hello_test` result with `blender_version` beginning `5.2` verifies that the running Blender instance consumed the job. There is no separate status indicator. For the smoke test, use a disposable Blender startup and do not save it over an existing project.
-
-To uninstall, disable the add-on in **Edit → Preferences → Add-ons**, close Blender, then remove only the installed `arena_workshop` folder. Keep or restore the backup as needed. Do not delete the mailbox or any `.blend` project as part of uninstalling.
+Backups are stored under `%LOCALAPPDATA%\ArenaBlenderWorkshop\addon-backups\arena_workshop_<timestamp>_<id>`. If an installation step fails, the updater attempts to restore the previous package and prints whether rollback succeeded plus the backup path. If it reports rollback needs attention, keep Blender closed and restore from that backup: rename the current `%APPDATA%\Blender Foundation\Blender\5.2\scripts\addons\arena_workshop` directory aside (do not delete it), then copy the backup directory to that exact `arena_workshop` location. Do not replace or remove any other add-on. Keep backups until the new install has been verified.
 
 ## Local CLI and Windows tests
 
@@ -133,5 +143,6 @@ From the repository root:
 
 ```text
 python -m unittest discover -s tests -v
+python -m unittest tests.test_addon_updater -v
 python -m compileall -q arena_workshop tests
 ```
