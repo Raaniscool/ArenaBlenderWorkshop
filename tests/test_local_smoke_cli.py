@@ -106,7 +106,9 @@ class CliWaitTests(unittest.TestCase):
         output = json.loads(self.stdout.getvalue())
         self.assertEqual(exit_code, 0)
         self.assertEqual(set(output), {"job_id", "result_path"})
-        self.assertEqual(output["result_path"], f"test-results/{output['job_id']}.json")
+        self.assertEqual(
+            Path(output["result_path"]), Path("test-results") / (output["job_id"] + ".json")
+        )
         self.mailbox.enqueue.assert_called_once()
         self.mailbox.read_result.assert_not_called()
         wait_mock.assert_not_called()
