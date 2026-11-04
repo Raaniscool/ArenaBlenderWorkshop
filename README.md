@@ -167,9 +167,61 @@ finally {
 
 Each successful call prints structured JSON. Check the `screenshot_path` in both capture results; the original `Cube` is not targeted by this workflow. The test checks the existing CLI/API results and adds a fake-`bpy` sequential workflow regression, but **does not replace executing this procedure in Blender 5.2**. If local Drive authorization is configured, a waited screenshot job automatically reports its Drive upload status and file ID as well as its local path; this documentation does not claim a real Windows/Blender upload was tested.
 
+## Phase 4B: outbound Linear worker (Windows)
+
+The optional `linear-worker` process polls Linear over outbound HTTPS and bridges approved job issues to the existing local file mailbox. It opens no inbound listener, does not change the Blender add-on, and accepts no Python, shell, or other executable content. It is a single-worker design for one Windows PC.
+
+### One-time Linear setup
+
+1. In Linear, use the existing **BlenderArena** team (issue key `BLE`). Create a **team-scoped** issue label named exactly `arena-blender-job`. Do not create a project for the initial setup; the worker filters by team, label, and state.
+2. In Linear's developer/API settings, create an OAuth application for this worker. Enable the `client_credentials` grant and authorize only `read`, `issues:create`, and `comments:create`. Restrict the app's team access to BlenderArena if that option is available. Do not use or copy Arena's connected-app credentials.
+3. Confirm the team has the workflow states `Todo`, `In Progress`, `Done`, and `Canceled`. A `Failed` state is optional; if present the worker uses it for failed jobs, otherwise it uses `Canceled` and writes the explicit `failed` status in its result comment.
+4. From PowerShell in the repository root, run:
+
+   ```powershell
+   python -m arena_workshop configure-linear
+   ```
+
+   Enter the OAuth client ID when prompted, then the client secret at the hidden prompt. The command validates the credentials with Linear before storing the client ID and secret as a DPAPI CurrentUser-protected file at `%LOCALAPPDATA%\ArenaBlenderWorkshop\linear_credentials.dpapi`. It never accepts the secret as a command-line argument, has no plaintext fallback, and discards the validation access token. The worker obtains its own fresh access token at startup and retries authentication after a 401. Re-run setup after rotating the OAuth client secret. To revoke access, revoke/rotate the OAuth application credentials in Linear and remove the protected local file.
+
+### Submit an Arena Blender job
+
+Create a Linear issue through Arena's connected Linear integration, or manually, with:
+
+- **Team:** BlenderArena (`BLE`)
+- **State:** `Todo`
+- **Label:** `arena-blender-job`
+- **Description:** exactly one raw JSON object with exactly `operation` and `parameters`; no Markdown fences or extra prose.
+
+For example:
+
+```json
+{"operation":"create_primitive","parameters":{"primitive_type":"cube","object_name":"ArenaCube","location":[0,0,0]}}
+```
+
+The worker generates `job_id` from the stable issue identifier (`linear-BLE-<number>`), fills protocol v1.0 fields and timestamps itself, and uses the already allowed `workspace_id: "test"`. The existing protocol validates the operation and every parameter. Unsupported fields/operations, duplicate JSON keys, malformed JSON, oversized requests, and invalid values are rejected and reported; the issue description is never interpreted as code.
+
+Only one Blender job is sent to the local mailbox at a time. The worker moves a new issue to `In Progress` after the stable-ID mailbox write, then waits for the add-on result. It reconciles existing inbox/processing/result files before enqueueing. A claimed job with no result after its deadline is reported as ambiguous for human review and is **not** automatically retried. Local terminal report records prevent a reopened issue from being executed a second time.
+
+### Run and stop the worker
+
+Keep Blender 5.2 open with the Arena Blender Workshop add-on enabled under the same Windows account. Then, in a separate PowerShell window in the repository root, start the worker manually:
+
+```powershell
+python -m arena_workshop linear-worker
+```
+
+The worker uses a Windows named mutex; another instance exits rather than polling concurrently. It polls every five seconds by default. Use `--poll-interval 10` to change the interval (valid range 1–60 seconds), or `--once` to validate/authenticate and perform one reconciliation cycle. Press Ctrl+C to stop. **The worker is not registered to start automatically at Windows sign-in.** Run it only on the Windows PC that owns the existing mailbox. No public listener, hosted service, or Blender add-on network access is involved.
+
+On successful Blender work, the worker posts a structured comment with a stable `ARENA_BLENDER_RESULT:linear-BLE-<number>:<content-hash>` marker and then moves the issue to `Done`. Failed requests/results use `Failed` when available, otherwise `Canceled`; the comment still says `status: failed`. Comment creation is verified by reading it back. A content-hash marker containing the stable job ID makes a retry of the same result reuse the existing comment without requiring `comments:update`; a deliberately changed report (such as a later successful manual Drive retry) becomes an idempotent result revision. The worker acknowledges mailbox result files only after the comment and terminal Linear state are confirmed. Network failures retain local results for a later worker cycle.
+
+For `capture_screenshot`, the worker reuses the existing local Google Drive uploader. Configure Drive separately with the existing `python -m arena_workshop authorize-drive` flow. The result comment includes Drive file ID/retrieval reference when upload succeeds; local Windows paths are not posted. PNGs remain in the local screenshots directory. If upload fails, the worker reports the failure to Linear and retains the local result so the existing `upload-screenshot --job-id linear-BLE-<number>` command can be used after Drive authorization/network recovery; the worker can then post an idempotent Linear result revision.
+
+Automated tests use fake Linear APIs and a mocked Windows mutex. They do not use real Linear credentials, Google authorization, a real Windows DPAPI store, or Blender; verify those manually on the Windows PC before relying on the live feedback loop.
+
 ## Current limitations
 
-- No Linear worker or Linear integration is included.
+- The worker is manually started and is intended for one Windows PC/one Blender add-on instance. It is not configured for Windows sign-in startup or multi-PC leasing.
 - Screenshot rendering uses the captured scene's active camera and current render engine; the camera view may need manual framing, and scenes without a linked camera fail cleanly. Render performance depends on the user's installed engine/device.
 - Screenshots are always retained locally. When the local Windows user authorizes Drive, the CLI can upload a screenshot and record its Drive file ID; Arena retrieval and actual visual inspection remain separate and must be verified independently.
 - `delete_object` is deliberately destructive for the named object. There is no arbitrary code, unrestricted operator, `.blend` save, or automatic scene cleanup.

@@ -6,5 +6,8 @@ __pycache__/
 **/google_oauth_client.json
 /drive_tokens.dpapi
 **/drive_tokens.dpapi
+# Linear OAuth client credentials protected for the current Windows user.
+/linear_credentials.dpapi
+**/linear_credentials.dpapi
 /token.json
 **/token.json
