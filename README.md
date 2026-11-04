@@ -63,21 +63,61 @@ To uninstall, disable the add-on in **Edit → Preferences → Add-ons**, close 
 
 Run commands from the repository root in PowerShell while Blender 5.2 is open with the add-on enabled. The CLI exposes only the allowlisted operations. `--wait` polls the result for that single enqueued job; it does not resubmit. Default timeout is 60 seconds; `--timeout SECONDS` changes it. Exit codes: `0` completed, `1` failed/unexpected result, `2` timed out. Omitting `--wait` keeps the previous behavior of printing the job ID and result path immediately.
 
-Basic test sequence (use unique names if repeating the create commands):
+### Compact Blender 5.2 verification (PowerShell)
+
+Run the unit suite from the repository root, then enable the add-on in Blender 5.2 and keep Blender open. The following workflow generates unique names, uses only its own test objects, checks each CLI exit code, captures screenshots before and after cleanup, and attempts to remove test objects even if a step fails. The test material becomes unused after object cleanup; remove only that generated material by name in Blender's Material Properties if you also want to clean it up.
 
 ```powershell
 python -m unittest discover -s tests -v
-python -m arena_workshop hello_test --wait --timeout 120
-python -m arena_workshop create_primitive --primitive-type cube --object-name Phase3Cube --location 0 0 0 --rotation 0 0 0 --scale 1 1 1 --wait --timeout 120
-python -m arena_workshop capture_screenshot --width 640 --height 480 --wait --timeout 180
-python -m arena_workshop set_dimensions --object-name Phase3Cube --dimensions 1 2 3 --wait --timeout 120
-python -m arena_workshop duplicate_object --object-name Phase3Cube --new-name Phase3CubeCopy --location 2 0 0 --wait --timeout 120
-python -m arena_workshop create_material --material-name Phase3Material --object-name Phase3CubeCopy --base-color 0.8 0.3 0.1 1 --roughness 0.35 --metallic 0.7 --wait --timeout 120
-python -m arena_workshop capture_screenshot --width 640 --height 480 --wait --timeout 180
-python -m arena_workshop delete_object --object-name Phase3CubeCopy --wait --timeout 120
+if ($LASTEXITCODE -ne 0) { throw "Unit tests failed with exit code $LASTEXITCODE" }
+
+function Invoke-ABWJob {
+    param([string[]]$CliArgs)
+    $output = & python -m arena_workshop @CliArgs --wait --timeout 180 2>&1
+    $exitCode = $LASTEXITCODE
+    $output | ForEach-Object { Write-Host $_ }
+    if ($exitCode -ne 0) {
+        throw "Arena Blender Workshop job failed with exit code ${exitCode}: $($CliArgs -join ' ')"
+    }
+}
+
+$tag = "ABWVerify_$([guid]::NewGuid().ToString('N').Substring(0,8))"
+$source = "${tag}_Source"
+$copy = "${tag}_Copy"
+$material = "${tag}_Material"
+$createdObjects = [System.Collections.Generic.List[string]]::new()
+$materialCreated = $false
+try {
+    Invoke-ABWJob -CliArgs @('create_primitive', '--primitive-type', 'cube', '--object-name', $source, '--location', '2', '0', '0')
+    $createdObjects.Add($source)
+    Invoke-ABWJob -CliArgs @('duplicate_object', '--object-name', $source, '--new-name', $copy, '--location', '4', '0', '0')
+    $createdObjects.Add($copy)
+    Invoke-ABWJob -CliArgs @('set_dimensions', '--object-name', $copy, '--dimensions', '1', '1.5', '2')
+    Invoke-ABWJob -CliArgs @('create_material', '--material-name', $material, '--object-name', $copy, '--base-color', '0.2', '0.5', '0.8', '1', '--roughness', '0.4', '--metallic', '0.2')
+    $materialCreated = $true
+    Invoke-ABWJob -CliArgs @('capture_screenshot', '--width', '640', '--height', '480')
+    Invoke-ABWJob -CliArgs @('delete_object', '--object-name', $copy)
+    $createdObjects.Remove($copy) | Out-Null
+    Invoke-ABWJob -CliArgs @('delete_object', '--object-name', $source)
+    $createdObjects.Remove($source) | Out-Null
+    Invoke-ABWJob -CliArgs @('capture_screenshot', '--width', '640', '--height', '480')
+}
+finally {
+    for ($i = $createdObjects.Count - 1; $i -ge 0; $i--) {
+        try {
+            Invoke-ABWJob -CliArgs @('delete_object', '--object-name', $createdObjects[$i])
+        }
+        catch {
+            Write-Warning "Test-object cleanup failed: $_"
+        }
+    }
+    if ($materialCreated) {
+        Write-Host "Remove only the unused test material '$material' in Blender if desired."
+    }
+}
 ```
 
-For visual iteration, read `screenshot_path` from the completed capture result, attach that PNG in the Arena conversation, request changes based on the visible result, submit the follow-up modeling job, and capture/attach another PNG. The CLI validates modeling and screenshot arguments before writing jobs to the mailbox. This local queue does not transfer image bytes to Arena automatically; the user must attach the PNG. Protocol, mailbox, and fake-`bpy` tests are not a substitute for running these commands with the real Blender 5.2 add-on.
+Each successful call prints structured JSON. Check the `screenshot_path` in both capture results; the original `Cube` is not targeted by this workflow. The test checks the existing CLI/API results and adds a fake-`bpy` sequential workflow regression, but **does not replace executing this procedure in Blender 5.2**. For Arena visual review, manually attach a PNG from the reported local path; the queue does not upload image bytes.
 
 ## Current limitations
 

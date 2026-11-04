@@ -596,6 +596,59 @@ class ModelingOperationTests(unittest.TestCase):
         self.assertIs(self.bpy.data.materials["ProtectedMaterial"], original)
         self.assertEqual(original.diffuse_color, (0.1, 0.2, 0.3, 1.0))
 
+    def test_phase_3b_verification_workflow_uses_only_temporary_objects(self):
+        source_name = "ABWCheckSource"
+        duplicate_name = "ABWCheckCopy"
+        material_name = "ABWCheckMaterial"
+        source_result = self.run_job(
+            "create_primitive",
+            {"primitive_type": "cube", "object_name": source_name, "location": [2, 0, 0]},
+            "verify-source",
+        )
+        duplicate_result = self.run_job(
+            "duplicate_object",
+            {"object_name": source_name, "new_name": duplicate_name, "location": [4, 0, 0]},
+            "verify-copy",
+        )
+        dimensions_result = self.run_job(
+            "set_dimensions", {"object_name": duplicate_name, "dimensions": [1, 1.5, 2]},
+            "verify-dimensions",
+        )
+        material_result = self.run_job(
+            "create_material", {
+                "material_name": material_name, "object_name": duplicate_name,
+                "base_color": [0.2, 0.5, 0.8, 1], "roughness": 0.4, "metallic": 0.2,
+            },
+            "verify-material",
+        )
+        self.assertTrue(source_result["created"])
+        self.assertTrue(duplicate_result["duplicated"])
+        self.assertEqual(dimensions_result["dimensions"], [1.0, 1.5, 2.0])
+        self.assertTrue(material_result["assigned"])
+        self.assertIs(self.bpy.data.objects[duplicate_name].data.materials[0],
+                      self.bpy.data.materials[material_name])
+
+        with tempfile.TemporaryDirectory() as directory:
+            screenshot = self.run_job(
+                "capture_screenshot", {}, "verify-before-cleanup",
+                screenshot_directory=directory,
+            )
+            self.assertTrue(Path(screenshot["screenshot_path"]).is_file())
+            deleted_copy = self.run_job("delete_object", {"object_name": duplicate_name}, "verify-delete-copy")
+            self.assertTrue(deleted_copy["deleted"])
+            self.assertNotIn(duplicate_name, self.bpy.data.objects)
+            self.assertIn(source_name, self.bpy.data.objects)
+            self.assertIs(self.bpy.data.objects["Cube"], self.original_cube)
+            self.run_job("delete_object", {"object_name": source_name}, "verify-delete-source")
+            final_screenshot = self.run_job(
+                "capture_screenshot", {}, "verify-after-cleanup",
+                screenshot_directory=directory,
+            )
+            self.assertTrue(Path(final_screenshot["screenshot_path"]).is_file())
+            self.assertNotIn(source_name, self.bpy.data.objects)
+            self.assertIs(self.bpy.data.objects["Cube"], self.original_cube)
+        self.assertIn(material_name, self.bpy.data.materials)
+
     def test_screenshot_is_written_with_metadata_and_render_settings_restored(self):
         scene = self.startup_scene
         render = scene.render
