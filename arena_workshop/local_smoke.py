@@ -1,4 +1,4 @@
-"""Create one fixed, local-only smoke-test job for the Blender add-on."""
+"""Restricted local CLI for queueing validated Blender mailbox jobs."""
 
 import argparse
 import json
@@ -8,22 +8,16 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from .mailbox import FileMailbox, default_queue_root
+from .protocol import JobValidationError, SUPPORTED_OPERATIONS, validate_job
 
 _DEFAULT_TIMEOUT_SECONDS = 60.0
 _POLL_INTERVAL_SECONDS = 0.25
+LOCAL_OPERATIONS = SUPPORTED_OPERATIONS
 
 
-def create_smoke_job(operation, now=None):
-    """Build one of the two protocol's fixed test jobs; accept no custom payload."""
+def _new_job(operation, parameters, now=None):
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).replace(microsecond=0)
-    if operation == "hello_test":
-        parameters = {"message": "Arena Blender Workshop local add-on smoke test"}
-    elif operation == "create_test_object":
-        parameters = {}
-    else:
-        raise ValueError("operation must be hello_test or create_test_object")
-
-    return {
+    job = {
         "protocol_version": "1.0",
         "job_id": "local-" + uuid.uuid4().hex,
         "workspace_id": "test",
@@ -35,6 +29,29 @@ def create_smoke_job(operation, now=None):
         "result": None,
         "error": None,
     }
+    return validate_job(job, {"test"}, now=now)
+
+
+def create_smoke_job(operation, now=None):
+    """Build one of the original fixed smoke tests; accept no custom payload."""
+    if operation == "hello_test":
+        parameters = {"message": "Arena Blender Workshop local add-on smoke test"}
+    elif operation == "create_test_object":
+        parameters = {}
+    else:
+        raise ValueError("operation must be hello_test or create_test_object")
+    return _new_job(operation, parameters, now=now)
+
+
+def create_local_job(operation, parameters=None, now=None):
+    """Build and validate one allowlisted test or modeling job."""
+    if operation not in LOCAL_OPERATIONS:
+        raise JobValidationError("unsupported_operation")
+    if operation == "hello_test" and parameters is None:
+        parameters = {"message": "Arena Blender Workshop local add-on smoke test"}
+    elif parameters is None:
+        parameters = {}
+    return _new_job(operation, parameters, now=now)
 
 
 def _positive_seconds(value):
@@ -60,9 +77,36 @@ def wait_for_result(mailbox, job_id, timeout, poll_interval=_POLL_INTERVAL_SECON
         time.sleep(min(poll_interval, remaining))
 
 
+def _build_cli_parameters(args):
+    params = {}
+    if args.operation == "hello_test":
+        params["message"] = "Arena Blender Workshop local add-on smoke test"
+
+    for field in ("primitive_type", "object_name", "location", "rotation", "scale",
+                  "new_name", "material_name", "base_color", "roughness", "metallic"):
+        value = getattr(args, field)
+        if value is not None:
+            params[field] = value
+    return params
+
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Queue a fixed local Blender add-on smoke test")
-    parser.add_argument("operation", choices=("hello_test", "create_test_object"))
+    parser = argparse.ArgumentParser(
+        description="Queue a validated, allowlisted Blender add-on test or modeling job"
+    )
+    parser.add_argument("operation", choices=LOCAL_OPERATIONS)
+    parser.add_argument("--primitive-type", choices=("cube", "uv_sphere", "cylinder", "plane", "cone"))
+    parser.add_argument("--object-name")
+    parser.add_argument("--location", nargs=3, type=float, metavar=("X", "Y", "Z"))
+    parser.add_argument("--rotation", nargs=3, type=float, metavar=("X", "Y", "Z"),
+                        help="Euler rotation in degrees")
+    parser.add_argument("--scale", nargs=3, type=float, metavar=("X", "Y", "Z"))
+    parser.add_argument("--new-name")
+    parser.add_argument("--material-name")
+    parser.add_argument("--base-color", nargs=4, type=float, metavar=("R", "G", "B", "A"),
+                        help="linear RGBA components from 0 to 1")
+    parser.add_argument("--roughness", type=float)
+    parser.add_argument("--metallic", type=float)
     parser.add_argument(
         "--wait",
         action="store_true",
@@ -77,7 +121,11 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
-    job = create_smoke_job(args.operation)
+    try:
+        job = create_local_job(args.operation, _build_cli_parameters(args))
+    except JobValidationError as exc:
+        parser.error("invalid operation parameters: {}".format(exc))
+
     mailbox = FileMailbox(default_queue_root())
     # Enqueue exactly once. Waiting only polls the result for this job ID.
     mailbox.enqueue(job)

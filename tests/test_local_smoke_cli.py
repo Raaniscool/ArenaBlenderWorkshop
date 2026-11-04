@@ -111,6 +111,26 @@ class CliWaitTests(unittest.TestCase):
         self.mailbox.read_result.assert_not_called()
         wait_mock.assert_not_called()
 
+    def test_modeling_command_enqueues_validated_parameters(self):
+        self.mailbox.read_result.return_value = {
+            "job_id": "local-test", "status": "completed", "result": {"created": True}
+        }
+        exit_code = self.run_cli([
+            "create_primitive", "--primitive-type", "cube", "--object-name", "CliCube",
+            "--location", "1", "2", "3", "--rotation", "0", "0", "45",
+            "--scale", "2", "2", "2", "--wait",
+        ])
+
+        self.assertEqual(exit_code, 0)
+        job = self.mailbox.enqueue.call_args.args[0]
+        self.assertEqual(job["operation"], "create_primitive")
+        self.assertEqual(job["parameters"], {
+            "primitive_type": "cube", "object_name": "CliCube",
+            "location": [1.0, 2.0, 3.0], "rotation": [0.0, 0.0, 45.0],
+            "scale": [2.0, 2.0, 2.0],
+        })
+        self.mailbox.enqueue.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

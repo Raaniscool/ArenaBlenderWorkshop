@@ -1,70 +1,81 @@
 # Arena Blender Workshop
 
-Minimal MVP path: Arena Agent Mode submits a structured job to the existing Linear queue; a Windows worker polls Linear over outbound HTTPS; the worker hands validated JSON to Blender through a local atomic file mailbox; a Blender 5.2 add-on executes a fixed allowlisted operation and returns a JSON result through the mailbox; the worker reports the result to Linear.
+A local Blender connector using a strict JSON protocol and an atomic file mailbox. The Blender add-on polls the mailbox using a Blender application timer and runs the fixed operation allowlist on Blender's main thread. The bridge opens no network listener and does not use arbitrary Python, shell commands, or unrestricted Blender operators.
 
-No local HTTP listener, port forwarding, tunnel, arbitrary shell execution, or arbitrary remote Python execution is used.
+## Phase 3A: basic modeling operations
 
-## Current implementation phase
+The protocol remains version `1.0`; previous `hello_test` and `create_test_object` jobs continue to work. The current allowlist is:
 
-The repository currently contains the **local protocol and Blender mailbox bridge**:
+| Operation | Required parameters | Optional parameters / behavior |
+| --- | --- | --- |
+| `hello_test` | `message` | Reports Blender version and current scene. |
+| `create_test_object` | none | Creates or detects the fixed `ArenaWorkshopTestCube`. |
+| `create_primitive` | `primitive_type`, `object_name` | Optional `location`, `rotation`, `scale`; types: `cube`, `uv_sphere`, `cylinder`, `plane`, `cone`. |
+| `move_object` | `object_name`, `location` | Sets the object's location. |
+| `rotate_object` | `object_name`, `rotation` | Sets Euler rotation in degrees (converted to Blender radians). |
+| `scale_object` | `object_name`, `scale` | Sets the object's scale; zero components are rejected. |
+| `rename_object` | `object_name`, `new_name` | Renames the existing object; does not create a replacement. |
+| `create_material` | `material_name`, `object_name`, `base_color`, `roughness`, `metallic` | Creates a Principled material and assigns it to the named mesh object. `base_color` is linear RGBA. |
 
-- `arena_workshop/protocol.py` strictly validates version 1.0 jobs and permits only `hello_test` and `create_test_object`.
-- `arena_workshop/mailbox.py` uses atomic same-volume file renames under `%LOCALAPPDATA%\ArenaBlenderWorkshop\queue`.
-- `arena_workshop/__init__.py` is a Blender add-on that polls the mailbox with Blender application timers and executes operations on Blender's main thread. `create_test_object` creates one fixed cube in a scene named `ArenaWorkshopTest`; it does not save the `.blend` file or change the active scene.
-- `python -m arena_workshop hello_test` or `python -m arena_workshop create_test_object` enqueues a fixed local smoke-test job; it accepts no custom operation payload.
-- Add `--wait` to print the result as formatted JSON after Blender completes it. The default timeout is 60 seconds; use `--timeout SECONDS` to change it. Waiting polls the same job and never resubmits it.
-- `tests/test_protocol_mailbox.py` tests validation and file-mailbox behavior without Blender or Windows.
+Vectors are three numeric values except `base_color`, which has four. Location, rotation, scale, color, roughness, and metallic are range-checked; object/material names are bounded and checked. Unknown fields and operations are rejected. Name conflicts and missing targets return structured failure results rather than replacing objects or materials.
 
-The Linear API worker and Windows credential setup have **not** been implemented. No credentials or external settings are stored here. Blender itself is not available in this development sandbox, so the add-on has not been exercised inside Blender 5.2 yet.
+Modeling operations target only `ArenaWorkshopTest`. It is created if needed, without switching Blender's active scene. Unrelated existing objects and materials are never deleted or replaced; only the explicitly named target object is transformed, renamed, or assigned a newly created material. Creating a primitive with a retried job ID is idempotent; a different job cannot silently replace an object with the same name. Transforms are assignments and can be retried safely. No operation saves or overwrites the `.blend` file.
 
-## Install the add-on in Blender 5.2 on Windows
+## Install or update the add-on in Blender 5.2 on Windows
 
-This repository uses Blender's legacy add-on package layout (`bl_info` in `arena_workshop/__init__.py`). Install the package folder in the per-user add-ons directory:
-
-1. Close Blender 5.2 before copying files. In File Explorer, enter `%APPDATA%\Blender Foundation\Blender\5.2\scripts\addons` in the address bar. Create the missing `scripts\addons` folders if necessary.
-2. Copy the repository's **`arena_workshop` folder** into that directory. The resulting file must be `%APPDATA%\Blender Foundation\Blender\5.2\scripts\addons\arena_workshop\__init__.py`.
-3. **Do not overwrite an existing `arena_workshop` folder.** If one is already there, first make a separate backup copy (for example `arena_workshop.backup`) and compare the contents; stop rather than replacing files you need.
-4. Start Blender 5.2. Open **Edit → Preferences → Add-ons**, search for **Arena Blender Workshop MVP**, and enable its checkbox. If it is not listed, check the folder layout and Blender version; do not install over another copy.
-5. Keep this Blender process open, with the add-on enabled, while using the CLI. The add-on's timer runs inside Blender; a closed Blender process cannot consume jobs. Use the same Windows account for Blender and the CLI because both use that account's `%LOCALAPPDATA%` mailbox.
-
-To verify the add-on is running, run `python -m arena_workshop hello_test --wait` from the repository root. A completed result containing `blender_version` beginning with `5.2` verifies that this Blender instance consumed the job. There is no separate add-on status indicator.
-
-To uninstall safely, disable the add-on in **Edit → Preferences → Add-ons**, close Blender, then remove only the `arena_workshop` folder you installed in `scripts\addons`. Do not remove the mailbox or any `.blend` files as part of uninstalling. If you backed up an earlier add-on folder, restore it only after removing this copy.
-
-## Local smoke test
-
-Run these from the repository root in a Windows terminal while Blender 5.2 is open with the add-on enabled:
+This is a legacy add-on package (`bl_info` in `arena_workshop/__init__.py`). Its expected per-user folder is:
 
 ```text
-python -m unittest discover -s tests -v
-python -m arena_workshop hello_test --wait
-python -m arena_workshop create_test_object --wait
+%APPDATA%\Blender Foundation\Blender\5.2\scripts\addons\arena_workshop\
 ```
 
-The first command tests the local Python package. The smoke-test commands enqueue one job each, wait up to 60 seconds, and print the result as formatted JSON. For example, to allow up to 120 seconds:
+The installed package must include `__init__.py`, `mailbox.py`, `protocol.py`, and **`operations.py`**.
 
-```text
+1. Close Blender 5.2. In File Explorer, enter `%APPDATA%\Blender Foundation\Blender\5.2\scripts\addons` in the address bar; create the missing `scripts\addons` folders if necessary.
+2. For a new install, copy the repository's whole `arena_workshop` folder into `addons`.
+3. To update the earlier Phase 2A install, first copy the existing installed `arena_workshop` folder to a separate backup location. Then replace its contents with the repository's current `arena_workshop` folder. Do not overwrite the old copy before making that backup; do not replace any other add-on folder.
+4. Start Blender 5.2. Open **Edit → Preferences → Add-ons**, search **Arena Blender Workshop MVP**, and enable it. If Blender does not list it, check the path and ensure `arena_workshop\__init__.py` is directly inside the package folder.
+5. Keep Blender open with the add-on enabled while sending jobs. The add-on timer runs inside Blender. Run the CLI as the same Windows user so it uses the same `%LOCALAPPDATA%\ArenaBlenderWorkshop\queue` mailbox.
+
+A completed `hello_test` result with `blender_version` beginning `5.2` verifies that the running Blender instance consumed the job. There is no separate status indicator. For the smoke test, use a disposable Blender startup and do not save it over an existing project.
+
+To uninstall, disable the add-on in **Edit → Preferences → Add-ons**, close Blender, then remove only the installed `arena_workshop` folder. Keep or restore the backup as needed. Do not delete the mailbox or any `.blend` project as part of uninstalling.
+
+## Local CLI and Windows tests
+
+Run commands from the repository root in PowerShell while Blender 5.2 is open with the add-on enabled. The CLI exposes only the allowlisted operations. `--wait` polls the result for that single enqueued job; it does not resubmit. Default timeout is 60 seconds; `--timeout SECONDS` changes it. Exit codes: `0` completed, `1` failed/unexpected result, `2` timed out. Omitting `--wait` keeps the previous behavior of printing the job ID and result path immediately.
+
+Basic test sequence (use unique names if repeating the create commands):
+
+```powershell
+python -m unittest discover -s tests -v
+python -m arena_workshop hello_test --wait --timeout 120
 python -m arena_workshop create_test_object --wait --timeout 120
+python -m arena_workshop create_primitive --primitive-type cube --object-name Phase3Cube --location 0 0 0 --rotation 0 0 0 --scale 1 1 1 --wait --timeout 120
+python -m arena_workshop move_object --object-name Phase3Cube --location 1 2 3 --wait --timeout 120
+python -m arena_workshop rotate_object --object-name Phase3Cube --rotation 0 0 45 --wait --timeout 120
+python -m arena_workshop scale_object --object-name Phase3Cube --scale 2 2 2 --wait --timeout 120
+python -m arena_workshop rename_object --object-name Phase3Cube --new-name Phase3CubeRenamed --wait --timeout 120
+python -m arena_workshop create_material --material-name Phase3Material --object-name Phase3CubeRenamed --base-color 0.8 0.3 0.1 1 --roughness 0.35 --metallic 0.7 --wait --timeout 120
+python -m arena_workshop create_primitive --primitive-type uv_sphere --object-name Phase3Sphere --wait --timeout 120
+python -m arena_workshop create_primitive --primitive-type cylinder --object-name Phase3Cylinder --wait --timeout 120
+python -m arena_workshop create_primitive --primitive-type plane --object-name Phase3Plane --wait --timeout 120
+python -m arena_workshop create_primitive --primitive-type cone --object-name Phase3Cone --wait --timeout 120
 ```
 
-A successful `hello_test` reports Blender's version. A successful `create_test_object` reports `scene_name: ArenaWorkshopTest`, `object_name: ArenaWorkshopTestCube`, 8 vertices, and 6 polygons. Running it again reports `created: false` rather than making a duplicate. Neither operation saves the current `.blend` file. Use a disposable Blender startup for the smoke test and do not save it over an existing project.
+The CLI validates modeling arguments before writing them to the mailbox. Protocol, mailbox, and fake-`bpy` operation tests run without Blender; they are not a substitute for running these commands with the real Blender 5.2 add-on.
 
-When `--wait` is omitted, the existing behavior is preserved: the command prints the job ID and result-file path immediately. With `--wait`, exit code `0` means completed, `1` means the job failed or returned an unexpected status, and `2` means the timeout elapsed. A timeout does not cancel or resubmit the queued job; Blender may still finish it later.
+## Current limitations
 
-## MVP sequence
+- No Linear worker or Linear integration is included in this phase.
+- Automated operation tests use a small Blender API test double. Actual mesh/material behavior still requires the Windows Blender 5.2 runtime test above.
+- Primitive geometry uses fixed lightweight defaults; there are no arbitrary dimensions, modifiers, file saves, deletions, or general-purpose scripts.
 
-1. Test protocol/mailbox locally.
-2. Install and smoke-test the add-on in Blender 5.2 using the steps above.
-3. After you configure and approve the Linear OAuth app, add the outbound-only Linear worker and safe credential retrieval.
-4. Run a fresh `create_test_object` job through Arena → Linear → worker → Blender → Linear → Arena.
-5. Add the two-chat test and image transfer only after the first end-to-end result succeeds.
+## Run tests and compilation checks
 
-OAuth scopes intended for the worker: `read`, `issues:create`, `comments:create`. The worker must be restricted to the BlenderArena (BLE) team before it is enabled.
-
-## Run the current tests
-
-From the repository root, with Python 3 installed:
+From the repository root:
 
 ```text
 python -m unittest discover -s tests -v
+python -m compileall -q arena_workshop tests
 ```

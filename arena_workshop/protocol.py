@@ -1,6 +1,7 @@
 """Strict, dependency-free job protocol shared by the worker and Blender add-on."""
 
 import json
+import math
 import re
 from datetime import datetime, timedelta, timezone
 
@@ -23,6 +24,18 @@ _REQUIRED_FIELDS = {
     "result",
     "error",
 }
+SUPPORTED_OPERATIONS = (
+    "hello_test",
+    "create_test_object",
+    "create_primitive",
+    "move_object",
+    "rotate_object",
+    "scale_object",
+    "rename_object",
+    "create_material",
+)
+PRIMITIVE_TYPES = {"cube", "uv_sphere", "cylinder", "plane", "cone"}
+MAX_OBJECT_NAME_LENGTH = 63
 
 
 class JobValidationError(ValueError):
@@ -52,6 +65,99 @@ def _parse_utc(value, field):
     if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
         raise JobValidationError("timestamp_must_be_utc")
     return parsed.astimezone(timezone.utc)
+
+
+def _validate_name(value, field):
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise JobValidationError("invalid_" + field)
+    if len(value) > MAX_OBJECT_NAME_LENGTH or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise JobValidationError("invalid_" + field)
+
+
+def _validate_vector(value, field, size=3, minimum=None, maximum=None, nonzero=False):
+    if not isinstance(value, list) or len(value) != size:
+        raise JobValidationError("invalid_" + field)
+    for component in value:
+        if isinstance(component, bool) or not isinstance(component, (int, float)):
+            raise JobValidationError("invalid_" + field)
+        try:
+            number = float(component)
+        except (OverflowError, ValueError):
+            raise JobValidationError("invalid_" + field)
+        if not math.isfinite(number):
+            raise JobValidationError("invalid_" + field)
+        if minimum is not None and number < minimum:
+            raise JobValidationError("invalid_" + field)
+        if maximum is not None and number > maximum:
+            raise JobValidationError("invalid_" + field)
+        if nonzero and number == 0:
+            raise JobValidationError("invalid_" + field)
+
+
+def _validate_params(operation, params):
+    if not isinstance(operation, str) or operation not in SUPPORTED_OPERATIONS:
+        raise JobValidationError("unsupported_operation")
+    if operation == "hello_test":
+        if set(params) != {"message"}:
+            raise JobValidationError("invalid_hello_test_parameters")
+        message = params["message"]
+        if not isinstance(message, str) or not message.strip() or len(message) > 256:
+            raise JobValidationError("invalid_hello_test_message")
+        return
+
+    if operation == "create_test_object":
+        if params:
+            raise JobValidationError("create_test_object_takes_no_parameters")
+        return
+
+    if operation == "create_primitive":
+        required = {"primitive_type", "object_name"}
+        allowed = required | {"location", "rotation", "scale"}
+        if not required.issubset(params) or not set(params).issubset(allowed):
+            raise JobValidationError("invalid_create_primitive_parameters")
+        if not isinstance(params["primitive_type"], str) or params["primitive_type"] not in PRIMITIVE_TYPES:
+            raise JobValidationError("invalid_primitive_type")
+        _validate_name(params["object_name"], "object_name")
+        if "location" in params:
+            _validate_vector(params["location"], "location", minimum=-1_000_000, maximum=1_000_000)
+        if "rotation" in params:
+            _validate_vector(params["rotation"], "rotation", minimum=-360_000, maximum=360_000)
+        if "scale" in params:
+            _validate_vector(params["scale"], "scale", minimum=-10_000, maximum=10_000, nonzero=True)
+        return
+
+    vector_operations = {
+        "move_object": ("location", -1_000_000, 1_000_000, False),
+        "rotate_object": ("rotation", -360_000, 360_000, False),
+        "scale_object": ("scale", -10_000, 10_000, True),
+    }
+    if operation in vector_operations:
+        field, minimum, maximum, nonzero = vector_operations[operation]
+        if set(params) != {"object_name", field}:
+            raise JobValidationError("invalid_" + operation + "_parameters")
+        _validate_name(params["object_name"], "object_name")
+        _validate_vector(params[field], field, minimum=minimum, maximum=maximum, nonzero=nonzero)
+        return
+
+    if operation == "rename_object":
+        if set(params) != {"object_name", "new_name"}:
+            raise JobValidationError("invalid_rename_object_parameters")
+        _validate_name(params["object_name"], "object_name")
+        _validate_name(params["new_name"], "new_name")
+        return
+
+    if operation == "create_material":
+        expected = {"material_name", "object_name", "base_color", "roughness", "metallic"}
+        if set(params) != expected:
+            raise JobValidationError("invalid_create_material_parameters")
+        _validate_name(params["material_name"], "material_name")
+        _validate_name(params["object_name"], "object_name")
+        _validate_vector(params["base_color"], "base_color", size=4, minimum=0, maximum=1)
+        for field in ("roughness", "metallic"):
+            _validate_vector([params[field]], field, size=1, minimum=0, maximum=1)
+        return
+
+    raise JobValidationError("unsupported_operation")
 
 
 def decode_job(raw, allowed_workspaces, now=None):
@@ -112,17 +218,5 @@ def validate_job(job, allowed_workspaces, now=None):
     params = job["parameters"]
     if not isinstance(params, dict):
         raise JobValidationError("parameters_must_be_object")
-
-    if operation == "hello_test":
-        if set(params) != {"message"}:
-            raise JobValidationError("invalid_hello_test_parameters")
-        message = params["message"]
-        if not isinstance(message, str) or not message.strip() or len(message) > 256:
-            raise JobValidationError("invalid_hello_test_message")
-    elif operation == "create_test_object":
-        if params:
-            raise JobValidationError("create_test_object_takes_no_parameters")
-    else:
-        raise JobValidationError("unsupported_operation")
-
+    _validate_params(operation, params)
     return dict(job)
