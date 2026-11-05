@@ -18,9 +18,54 @@ class TestScene:
         self.objects = FakeObjects(objects or {})
 
 
+class TestMesh:
+    def __init__(self):
+        self.name = "Cube"
+        self.vertices = [
+            (-1.0, -1.0, -1.0), (1.0, -1.0, -1.0),
+            (1.0, 1.0, -1.0), (-1.0, 1.0, -1.0),
+            (-1.0, -1.0, 1.0), (1.0, -1.0, 1.0),
+            (1.0, 1.0, 1.0), (-1.0, 1.0, 1.0),
+        ]
+        self.polygons = [
+            SimpleNamespace(vertices=face)
+            for face in ((0, 1, 2, 3), (4, 7, 6, 5), (0, 4, 5, 1),
+                         (1, 5, 6, 2), (2, 6, 7, 3), (4, 0, 3, 7))
+        ]
+        self.materials = []
+        self.shape_keys = None
+        self.users = 1
+
+    def keys(self):
+        return ()
+
+
+class TestObject:
+    def __init__(self):
+        self.name = "Cube"
+        self.type = "MESH"
+        self.data = TestMesh()
+        self.location = (0.0, 0.0, 0.0)
+        self.rotation_euler = (0.0, 0.0, 0.0)
+        self.rotation_mode = "XYZ"
+        self.scale = (1.0, 1.0, 1.0)
+        self.parent = None
+        self.animation_data = None
+        self.modifiers = []
+        self.constraints = []
+        self.children = []
+        self.material_slots = []
+        self.hide_viewport = False
+        self.hide_render = False
+        self.users_collection = (object(),)
+
+    def keys(self):
+        return ()
+
+
 class TestScenes:
     def __init__(self):
-        self.startup_scene = TestScene("Scene", {"Cube": object()})
+        self.startup_scene = TestScene("Scene")
         self.switched_scene = TestScene("SwitchedScene")
 
     def __iter__(self):
@@ -28,6 +73,20 @@ class TestScenes:
 
     def get(self, name):
         return next((scene for scene in self if scene.name == name), None)
+
+
+class TestObjectCollection(dict):
+    def __init__(self, scenes):
+        super().__init__()
+        self.scenes = scenes
+        self.removal_count = 0
+
+    def remove(self, obj, do_unlink=True):
+        self.removal_count += 1
+        self.pop(obj.name, None)
+        if do_unlink:
+            for scene in self.scenes:
+                scene.objects.pop(obj.name, None)
 
 
 class FakeTimers:
@@ -56,7 +115,12 @@ class FakeTimers:
 
 class TestBpy:
     def __init__(self, restricted=False):
-        self._data = type("Data", (), {"scenes": TestScenes()})()
+        scenes = TestScenes()
+        objects = TestObjectCollection(scenes)
+        default_cube = TestObject()
+        scenes.startup_scene.objects[default_cube.name] = default_cube
+        objects[default_cube.name] = default_cube
+        self._data = type("Data", (), {"scenes": scenes, "objects": objects})()
         self.allow_data = not restricted
         self.data_accesses = 0
         self.context = type("Context", (), {"scene": self._data.scenes.startup_scene})()
@@ -126,7 +190,13 @@ class AddonResultTests(unittest.TestCase):
                 create_mailbox.assert_called_once()
                 captured_scene = addon._startup_scene
                 self.assertIs(captured_scene, bpy_instance._data.scenes.startup_scene)
+                self.assertEqual(bpy_instance._data.objects.removal_count, 1)
+                self.assertNotIn("Cube", captured_scene.objects)
                 self.assertEqual(set(timers.callbacks), {addon._poll_mailbox})
+
+                # Re-running initialization against the same scene is a no-op.
+                self.assertIsNone(addon._initialize_addon())
+                self.assertEqual(bpy_instance._data.objects.removal_count, 1)
 
                 bpy_instance.context.scene = bpy_instance._data.scenes.switched_scene
                 job = {"job_id": "captured-target"}
@@ -154,6 +224,8 @@ class AddonResultTests(unittest.TestCase):
                 self.assertEqual(set(timers.callbacks), {addon._initialize_addon})
                 self.assertIsNone(timers.run_once(addon._initialize_addon))
                 self.assertEqual(set(timers.callbacks), {addon._poll_mailbox})
+                self.assertEqual(bpy_instance._data.objects.removal_count, 1)
+                self.assertNotIn("Cube", bpy_instance._data.scenes.startup_scene.objects)
                 addon.unregister()
                 self.assertFalse(timers.callbacks)
         finally:

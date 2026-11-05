@@ -48,6 +48,127 @@ def resolve_startup_scene(bpy):
     return scenes[0] if scenes else None
 
 
+def _matches_default_cube_geometry(mesh):
+    """Require the untouched eight-vertex, six-quad Blender startup mesh."""
+    expected_vertices = {
+        (x, y, z)
+        for x in (-1.0, 1.0)
+        for y in (-1.0, 1.0)
+        for z in (-1.0, 1.0)
+    }
+    vertices = []
+    try:
+        for vertex in mesh.vertices:
+            coordinates = getattr(vertex, "co", vertex)
+            point = tuple(float(component) for component in coordinates)
+            if len(point) != 3:
+                return False
+            vertices.append(point)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if len(vertices) != 8 or set(vertices) != expected_vertices:
+        return False
+
+    expected_faces = {
+        frozenset(vertex for vertex in expected_vertices if vertex[axis] == side)
+        for axis in range(3)
+        for side in (-1.0, 1.0)
+    }
+    actual_faces = set()
+    try:
+        for polygon in mesh.polygons:
+            indices = tuple(getattr(polygon, "vertices", polygon))
+            if len(indices) != 4 or any(index < 0 or index >= len(vertices) for index in indices):
+                return False
+            actual_faces.add(frozenset(vertices[index] for index in indices))
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return len(actual_faces) == 6 and actual_faces == expected_faces
+
+
+def _has_custom_properties(datablock):
+    """Treat unknown custom-property state as customized; deletion must be conservative."""
+    try:
+        return bool(list(datablock.keys()))
+    except (AttributeError, TypeError, RuntimeError):
+        return True
+
+
+def _untouched_default_cube(obj):
+    if (getattr(obj, "name", None) != DEFAULT_CUBE_NAME
+            or getattr(obj, "type", None) != "MESH"):
+        return False
+    mesh = getattr(obj, "data", None)
+    if mesh is None or getattr(mesh, "name", None) != DEFAULT_CUBE_NAME:
+        return False
+    if getattr(mesh, "users", None) != 1 or not _matches_default_cube_geometry(mesh):
+        return False
+    try:
+        if len(obj.users_collection) != 1:
+            return False
+    except (AttributeError, TypeError):
+        return False
+
+    defaults = (
+        ("location", (0.0, 0.0, 0.0)),
+        ("rotation_euler", (0.0, 0.0, 0.0)),
+        ("scale", (1.0, 1.0, 1.0)),
+    )
+    try:
+        if any(tuple(float(value) for value in getattr(obj, name)) != expected
+               for name, expected in defaults):
+            return False
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+    if (getattr(obj, "rotation_mode", None) != "XYZ"
+            or getattr(obj, "parent", None) is not None
+            or getattr(obj, "animation_data", None) is not None
+            or getattr(mesh, "shape_keys", None) is not None):
+        return False
+    for name in ("modifiers", "constraints", "children", "material_slots"):
+        try:
+            if len(getattr(obj, name)) != 0:
+                return False
+        except (AttributeError, TypeError):
+            return False
+    for name in ("materials",):
+        try:
+            if len(getattr(mesh, name)) != 0:
+                return False
+        except (AttributeError, TypeError):
+            return False
+    if bool(getattr(obj, "hide_viewport", True)) or bool(getattr(obj, "hide_render", True)):
+        return False
+    hide_get = getattr(obj, "hide_get", None)
+    if callable(hide_get):
+        try:
+            if hide_get():
+                return False
+        except Exception:
+            return False
+    return not _has_custom_properties(obj) and not _has_custom_properties(mesh)
+
+
+def remove_default_startup_cube(bpy, startup_scene):
+    """Remove only Blender's unchanged, unshared startup cube; otherwise do nothing."""
+    if startup_scene is None:
+        return False
+    obj = startup_scene.objects.get(DEFAULT_CUBE_NAME)
+    if obj is None or not _untouched_default_cube(obj):
+        return False
+    if bpy.data.objects.get(DEFAULT_CUBE_NAME) is not obj:
+        return False
+
+    linked_scenes = [scene for scene in bpy.data.scenes
+                     if scene.objects.get(DEFAULT_CUBE_NAME) is obj]
+    if len(linked_scenes) != 1 or linked_scenes[0] is not startup_scene:
+        return False
+
+    bpy.data.objects.remove(obj, do_unlink=True)
+    return True
+
+
 def _target_scene(bpy, startup_scene=None):
     scene = startup_scene if startup_scene is not None else resolve_startup_scene(bpy)
     if scene is None:

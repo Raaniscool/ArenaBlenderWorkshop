@@ -19,7 +19,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .mailbox import FileMailbox, default_queue_root
-from .operations import OperationError, execute_job, resolve_startup_scene
+from .operations import (
+    OperationError,
+    execute_job,
+    remove_default_startup_cube,
+    resolve_startup_scene,
+)
 
 _LOG = logging.getLogger("arena_blender_workshop")
 _POLL_SECONDS = 0.5
@@ -104,6 +109,8 @@ def _initialize_addon():
             _startup_scene = resolve_startup_scene(_bpy)
             if _startup_scene is None:
                 raise RuntimeError("Arena Blender Workshop could not find a startup scene")
+            if remove_default_startup_cube(_bpy, _startup_scene):
+                _LOG.info("Removed Blender's untouched startup cube")
         if _mailbox is None:
             _mailbox = FileMailbox(default_queue_root())
         timers = _bpy.app.timers

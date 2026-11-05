@@ -8,6 +8,7 @@ from arena_workshop.operations import (
     SMOKE_TEST_OBJECT,
     OperationError,
     execute_job,
+    remove_default_startup_cube,
     resolve_startup_scene,
 )
 from arena_workshop.protocol import JobValidationError, validate_job
@@ -19,6 +20,12 @@ class FakeMesh:
         self.vertices = []
         self.polygons = []
         self.materials = []
+        self.shape_keys = None
+        self.users = 1
+        self._custom_properties = {}
+
+    def keys(self):
+        return self._custom_properties.keys()
 
     def from_pydata(self, vertices, edges, faces):
         self.vertices = list(vertices)
@@ -78,6 +85,9 @@ class FakeDataBlock:
     def __setitem__(self, key, value):
         self._custom_properties[key] = value
 
+    def keys(self):
+        return self._custom_properties.keys()
+
 
 class FakeMaterial(FakeDataBlock):
     def __init__(self, name):
@@ -111,9 +121,22 @@ class FakeObject(FakeDataBlock):
         self._collections = []
         self.location = (0.0, 0.0, 0.0)
         self.rotation_euler = (0.0, 0.0, 0.0)
+        self.rotation_mode = "XYZ"
         self.scale = (1.0, 1.0, 1.0)
         self.type = "MESH"
+        self.parent = None
+        self.animation_data = None
+        self.modifiers = []
+        self.constraints = []
+        self.children = []
+        self.material_slots = []
+        self.hide_viewport = False
+        self.hide_render = False
         self._dimensions = (2.0, 2.0, 2.0)
+
+    @property
+    def users_collection(self):
+        return tuple(self._collections)
 
     @property
     def dimensions(self):
@@ -271,7 +294,7 @@ class FakeBpy:
         self.data.objects = objects
         self.data.meshes = FakeMeshes()
         self.data.materials = FakeMaterials()
-        cube_mesh = self.data.meshes.new("CubeMesh")
+        cube_mesh = self.data.meshes.new("Cube")
         cube_mesh.from_pydata(
             [(-1, -1, -1), (1, -1, -1), (1, 1, -1), (-1, 1, -1),
              (-1, -1, 1), (1, -1, 1), (1, 1, 1), (-1, 1, 1)],
@@ -398,6 +421,47 @@ class ModelingProtocolTests(unittest.TestCase):
         for operation in ("run_python", ["create_primitive"]):
             with self.subTest(operation=operation), self.assertRaises(JobValidationError):
                 validated(make_job(operation, {}))
+
+
+class DefaultCubeCleanupTests(unittest.TestCase):
+    def setUp(self):
+        self.bpy = FakeBpy()
+        self.scene = self.bpy.startup_scene
+
+    def test_removes_only_default_cube_and_preserves_camera_and_lights(self):
+        light_data = self.bpy.data.meshes.new("LightData")
+        light = self.bpy.data.objects.new("Light", light_data)
+        light.type = "LIGHT"
+        self.scene.collection.objects.link(light)
+
+        self.assertTrue(remove_default_startup_cube(self.bpy, self.scene))
+        self.assertIsNone(self.scene.objects.get("Cube"))
+        self.assertNotIn("Cube", self.bpy.data.objects)
+        self.assertIs(self.scene.objects.get("Camera"), self.bpy.camera)
+        self.assertIs(self.scene.objects.get("Light"), light)
+        self.assertIs(self.scene.camera, self.bpy.camera)
+
+    def test_preserves_user_modified_cube_and_other_user_objects(self):
+        self.bpy.default_cube.location = (0.25, 0.0, 0.0)
+        user_mesh = self.bpy.data.meshes.new("UserMesh")
+        user_object = self.bpy.data.objects.new("UserCreated", user_mesh)
+        self.scene.collection.objects.link(user_object)
+
+        self.assertFalse(remove_default_startup_cube(self.bpy, self.scene))
+        self.assertIs(self.bpy.data.objects.get("Cube"), self.bpy.default_cube)
+        self.assertIs(self.scene.objects.get("UserCreated"), user_object)
+
+    def test_does_not_remove_arena_tagged_cube(self):
+        self.bpy.default_cube["arena_workshop_job_id"] = "linear-BLE-99"
+
+        self.assertFalse(remove_default_startup_cube(self.bpy, self.scene))
+        self.assertIs(self.bpy.data.objects.get("Cube"), self.bpy.default_cube)
+
+    def test_cleanup_is_idempotent(self):
+        self.assertTrue(remove_default_startup_cube(self.bpy, self.scene))
+        self.assertFalse(remove_default_startup_cube(self.bpy, self.scene))
+        self.assertNotIn("Cube", self.bpy.data.objects)
+        self.assertIs(self.bpy.data.objects.get("Camera"), self.bpy.camera)
 
 
 class ModelingOperationTests(unittest.TestCase):
