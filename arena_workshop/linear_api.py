@@ -3,6 +3,7 @@
 import base64
 import json
 import os
+import re
 import stat
 import tempfile
 import urllib.error
@@ -33,14 +34,15 @@ def _default_opener(request, timeout=HTTP_TIMEOUT_SECONDS):
 
 
 class LinearApiError(RuntimeError):
-    """Safe error; messages never contain tokens, secrets, or response bodies."""
+    """Linear API failure with sanitized details and request metadata."""
 
-    def __init__(self, code, message, retryable=False, status=None):
+    def __init__(self, code, message, retryable=False, status=None, endpoint=None):
         super().__init__(message)
         self.code = code
         self.message = message
         self.retryable = retryable
         self.status = status
+        self.endpoint = endpoint
 
 
 def default_credential_path():
@@ -122,7 +124,57 @@ class LinearCredentialStore:
             raise LinearApiError("credential_store_delete_failed", "The protected Linear credential store could not be removed.") from exc
 
 
-def _read_json(opener, request, timeout=HTTP_TIMEOUT_SECONDS):
+def _safe_error_details(raw, sensitive_values=()):
+    """Extract only short structured messages, never echo an entire API response."""
+    try:
+        payload = json.loads(raw.decode("utf-8")) if isinstance(raw, bytes) else raw
+    except (UnicodeDecodeError, ValueError):
+        return "Linear returned a non-JSON error response."
+
+    def clean(value):
+        if not isinstance(value, str):
+            return None
+        text = value
+        for secret in sensitive_values:
+            if isinstance(secret, str) and secret:
+                text = text.replace(secret, "[REDACTED]")
+        text = re.sub(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]+", r"\1 [REDACTED]", text)
+        text = re.sub(
+            r"(?i)\b(access_token|refresh_token|client_secret|authorization|token)\b(\s*[:=]\s*)[^,;\s}]+",
+            r"\1\2[REDACTED]", text,
+        )
+        text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text[:400] or None
+
+    if not isinstance(payload, dict):
+        return "Linear returned an error without structured details."
+    details = []
+    errors = payload.get("errors")
+    if isinstance(errors, list):
+        for error in errors[:3]:
+            if not isinstance(error, dict):
+                continue
+            extensions = error.get("extensions")
+            code = extensions.get("code") if isinstance(extensions, dict) else error.get("code")
+            message = clean(error.get("message"))
+            safe_code = clean(code) if isinstance(code, str) else None
+            if safe_code and message:
+                details.append("{}: {}".format(safe_code, message))
+            elif safe_code or message:
+                details.append(safe_code or message)
+    if not details:
+        for key in ("error_description", "message", "error", "description"):
+            message = clean(payload.get(key))
+            if message:
+                details.append(message)
+                if len(details) >= 3:
+                    break
+    return "; ".join(details)[:900] if details else "Linear returned an error without safe structured details."
+
+
+def _read_json(opener, request, timeout=HTTP_TIMEOUT_SECONDS, sensitive_values=()):
+    endpoint = "OAuth token endpoint" if request.full_url == TOKEN_URL else "GraphQL endpoint"
     try:
         response = opener(request, timeout=timeout)
         with response:
@@ -137,22 +189,37 @@ def _read_json(opener, request, timeout=HTTP_TIMEOUT_SECONDS):
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise LinearApiError(
             "network_error", "A request to Linear failed ({}).".format(type(exc).__name__),
-            retryable=True,
+            retryable=True, endpoint=endpoint,
         ) from exc
     if len(raw) > MAX_RESPONSE_BYTES:
-        raise LinearApiError("response_too_large", "Linear returned an unexpectedly large response.", status=status)
-    if status == 401:
-        raise LinearApiError("unauthorized", "Linear rejected the worker authorization.", status=status)
-    if status == 429 or status >= 500:
-        raise LinearApiError("linear_unavailable", "Linear returned a temporary service error.", retryable=True, status=status)
+        raise LinearApiError(
+            "response_too_large", "Linear returned an unexpectedly large response.",
+            status=status, endpoint=endpoint,
+        )
+    auth = request.get_header("Authorization") or request.get_header("authorization")
+    secrets = list(sensitive_values)
+    if auth:
+        secrets.extend((auth, auth.split(" ", 1)[-1]))
     if status >= 400:
-        raise LinearApiError("linear_http_error", "Linear rejected the worker request.", status=status)
+        detail = _safe_error_details(raw, secrets)
+        if status == 401:
+            raise LinearApiError("unauthorized", detail, status=status, endpoint=endpoint)
+        if status == 429 or status >= 500:
+            raise LinearApiError(
+                "linear_unavailable", detail, retryable=True, status=status, endpoint=endpoint,
+            )
+        raise LinearApiError("linear_http_error", detail, status=status, endpoint=endpoint)
     try:
         value = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
-        raise LinearApiError("invalid_linear_response", "Linear returned invalid JSON.", status=status) from exc
+        raise LinearApiError(
+            "invalid_linear_response", "Linear returned invalid JSON.", status=status, endpoint=endpoint,
+        ) from exc
     if not isinstance(value, dict):
-        raise LinearApiError("invalid_linear_response", "Linear returned an invalid response object.", status=status)
+        raise LinearApiError(
+            "invalid_linear_response", "Linear returned an invalid response object.",
+            status=status, endpoint=endpoint,
+        )
     return value
 
 
@@ -183,7 +250,7 @@ class LinearApi:
             },
             method="POST",
         )
-        response = _read_json(self.opener, request)
+        response = _read_json(self.opener, request, sensitive_values=(self._client_secret,))
         token = response.get("access_token")
         if not isinstance(token, str) or not token:
             raise LinearApiError("token_response_invalid", "Linear did not return a valid access token.")
@@ -207,7 +274,10 @@ class LinearApi:
                 method="POST",
             )
             try:
-                response = _read_json(self.opener, request)
+                response = _read_json(
+                    self.opener, request,
+                    sensitive_values=(self._client_secret, self._access_token),
+                )
             except LinearApiError as exc:
                 if exc.code == "unauthorized" and not refreshed:
                     self._access_token = None
@@ -217,7 +287,10 @@ class LinearApi:
                 raise
             errors = response.get("errors")
             if errors:
-                raise LinearApiError("graphql_error", "Linear could not complete the requested operation.")
+                detail = _safe_error_details(
+                    {"errors": errors}, (self._client_secret, self._access_token),
+                )
+                raise LinearApiError("graphql_error", detail, status=200, endpoint="GraphQL endpoint")
             data = response.get("data")
             if not isinstance(data, dict):
                 raise LinearApiError("invalid_linear_response", "Linear returned an incomplete GraphQL response.")

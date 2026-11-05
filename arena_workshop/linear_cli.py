@@ -91,19 +91,24 @@ def submit_main(argv=None, store=None, api_factory=LinearApi, input_stream=None)
         print("Linear job description rejected ({}).".format(str(exc)), file=sys.stderr)
         return 2
 
+    phase = "load protected credentials"
     try:
         credentials = (store or LinearCredentialStore()).load()
         if credentials is None:
             raise LinearApiError("authorization_required", "Run configure-linear on this Windows PC first.")
         api = api_factory(credentials["client_id"], credentials["client_secret"])
         dispatch_attempted = False
+        phase = "resolve team BLE"
         team_id = api.get_team_id(TEAM_KEY)
+        phase = "resolve workflow states"
         states = api.get_workflow_states(TEAM_KEY)
         backlog_id = states.get("Backlog")
         todo_id = states.get("Todo")
         if not isinstance(backlog_id, str) or not backlog_id:
             raise LinearApiError("workflow_state_missing", "BlenderArena is missing the Backlog workflow state.")
+        phase = "resolve team-scoped job label"
         label_id = api.get_issue_label_id(team_id, QUEUE_LABEL)
+        phase = "create issue in Backlog"
         created = api.create_issue(
             team_id=team_id,
             title=args.title,
@@ -117,6 +122,7 @@ def submit_main(argv=None, store=None, api_factory=LinearApi, input_stream=None)
         if not isinstance(identifier, str) or not isinstance(issue_id, str):
             raise LinearApiError("invalid_linear_response", "Linear created an issue without a stable identifier.")
 
+        phase = "verify created issue round trip"
         verified = api.get_issue(identifier)
         if not isinstance(verified, dict):
             raise LinearApiError("invalid_linear_response", "Linear did not return the newly created job issue.")
@@ -147,8 +153,10 @@ def submit_main(argv=None, store=None, api_factory=LinearApi, input_stream=None)
         if args.dispatch:
             if not isinstance(todo_id, str) or not todo_id:
                 raise LinearApiError("workflow_state_missing", "BlenderArena is missing the Todo workflow state.")
+            phase = "dispatch verified issue to Todo"
             dispatch_attempted = True
             api.update_issue_state(issue_id, todo_id)
+            phase = "verify dispatched issue"
             verified = api.get_issue(identifier)
             if not isinstance(verified, dict):
                 raise LinearApiError("invalid_linear_response", "Linear did not return the dispatched job issue.")
@@ -163,7 +171,13 @@ def submit_main(argv=None, store=None, api_factory=LinearApi, input_stream=None)
     except (LinearApiError, OSError, JobValidationError) as exc:
         code = getattr(exc, "code", str(exc) if isinstance(exc, JobValidationError) else "linear_submit_failed")
         message = getattr(exc, "message", "The job issue could not be submitted safely.")
-        print("Linear job submission failed ({}): {}".format(code, message), file=sys.stderr)
+        status = getattr(exc, "status", None)
+        endpoint = getattr(exc, "endpoint", None)
+        endpoint_text = " via {}".format(endpoint) if endpoint else ""
+        status_text = ", HTTP {}".format(status) if status is not None else ""
+        print("Linear job submission failed during {}{} ({}{}): {}".format(
+            phase, endpoint_text, code, status_text, message,
+        ), file=sys.stderr)
         if "identifier" in locals() and isinstance(identifier, str):
             if locals().get("dispatch_attempted"):
                 detail = "dispatch may have been applied; inspect the new issue before retrying."

@@ -112,12 +112,14 @@ class LinearApiTests(unittest.TestCase):
         secret = "do-not-print-this"
 
         def opener(request, timeout=30):
-            raise urllib.error.HTTPError(TOKEN_URL, 401, "Unauthorized", {}, None)
+            body = json.dumps({"error": "invalid_client", "error_description": "Rejected " + secret}).encode("utf-8")
+            raise urllib.error.HTTPError(TOKEN_URL, 401, "Unauthorized", {}, io.BytesIO(body))
 
         api = LinearApi("client-id", secret, opener=opener)
         with self.assertRaises(LinearApiError) as raised:
             api.authenticate()
         self.assertEqual(raised.exception.code, "unauthorized")
+        self.assertEqual(raised.exception.endpoint, "OAuth token endpoint")
         self.assertNotIn(secret, str(raised.exception))
         self.assertIsNone(api._access_token)
 
@@ -125,13 +127,59 @@ class LinearApiTests(unittest.TestCase):
         def opener(request, timeout=30):
             if request.full_url == TOKEN_URL:
                 return FakeResponse({"access_token": "access"})
-            return FakeResponse({"data": {}, "errors": [{"message": "private detail"}]})
+            return FakeResponse({"data": {}, "errors": [{
+                "message": "Permission denied for Bearer access",
+                "extensions": {"code": "FORBIDDEN"},
+            }]})
 
         api = LinearApi("client", "secret", opener=opener)
         with self.assertRaises(LinearApiError) as raised:
             api.graphql("query { viewer { id } }")
         self.assertEqual(raised.exception.code, "graphql_error")
-        self.assertNotIn("private detail", str(raised.exception))
+        self.assertEqual(raised.exception.status, 200)
+        self.assertEqual(raised.exception.endpoint, "GraphQL endpoint")
+        self.assertIn("FORBIDDEN", str(raised.exception))
+        self.assertIn("Permission denied", str(raised.exception))
+        self.assertNotIn("Bearer access", str(raised.exception))
+        self.assertNotIn("secret", str(raised.exception))
+
+    def test_http_error_reports_status_and_safe_linear_details_without_tokens(self):
+        token = "sensitive-access-token"
+        detail = "OAuth token " + token + " was denied by policy"
+
+        def opener(request, timeout=30):
+            if request.full_url == TOKEN_URL:
+                return FakeResponse({"access_token": token})
+            body = json.dumps({"errors": [{
+                "message": detail,
+                "extensions": {"code": "FORBIDDEN"},
+                "debug": "must not be printed",
+            }]}).encode("utf-8")
+            raise urllib.error.HTTPError(GRAPHQL_URL, 403, "Forbidden", {}, io.BytesIO(body))
+
+        api = LinearApi("client", "secret", opener=opener)
+        with self.assertRaises(LinearApiError) as raised:
+            api.graphql("query { viewer { id } }")
+        self.assertEqual(raised.exception.code, "linear_http_error")
+        self.assertEqual(raised.exception.status, 403)
+        self.assertIn("FORBIDDEN", raised.exception.message)
+        self.assertIn("was denied by policy", raised.exception.message)
+        self.assertNotIn(token, raised.exception.message)
+        self.assertNotIn("must not be printed", raised.exception.message)
+
+    def test_unstructured_http_error_never_echoes_response_body(self):
+        secret = "do-not-leak"
+
+        def opener(request, timeout=30):
+            body = b"<html>Bearer " + secret.encode("ascii") + b" internal stack trace</html>"
+            raise urllib.error.HTTPError(TOKEN_URL, 400, "Bad Request", {}, io.BytesIO(body))
+
+        api = LinearApi("client", secret, opener=opener)
+        with self.assertRaises(LinearApiError) as raised:
+            api.authenticate()
+        self.assertEqual(raised.exception.status, 400)
+        self.assertNotIn(secret, raised.exception.message)
+        self.assertNotIn("internal stack trace", raised.exception.message)
 
     def test_job_description_validation_accepts_nested_objects_arrays_and_escaped_strings(self):
         request = {
@@ -305,6 +353,32 @@ class LinearSubmitCliTests(unittest.TestCase):
         self.assertEqual(api.issue["state"]["name"], "Todo")
         self.assertEqual(api.state_updates, ["todo-id"])
         self.assertTrue(json.loads(output.getvalue())["description_verified"])
+
+    def test_submission_error_shows_phase_and_http_status(self):
+        class FailingApi:
+            def __init__(self, client_id, client_secret):
+                pass
+
+            def get_team_id(self, team_key):
+                raise LinearApiError(
+                    "linear_http_error", "FORBIDDEN: Team access denied", status=403,
+                    endpoint="GraphQL endpoint",
+                )
+
+        description = json.dumps({"operation": "hello_test", "parameters": {"message": "smoke"}})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "job.json"
+            path.write_text(description, encoding="utf-8")
+            with contextlib.redirect_stderr(io.StringIO()) as error_output:
+                status = submit_main(
+                    ["--title", "Diagnostic", "--description-file", str(path)],
+                    store=self.Store(), api_factory=FailingApi,
+                )
+
+        self.assertEqual(status, 1)
+        self.assertIn("during resolve team BLE via GraphQL endpoint", error_output.getvalue())
+        self.assertIn("linear_http_error, HTTP 403", error_output.getvalue())
+        self.assertIn("FORBIDDEN: Team access denied", error_output.getvalue())
 
     def test_submission_keeps_unverified_or_invalid_jobs_out_of_todo(self):
         class UnusedStore:
