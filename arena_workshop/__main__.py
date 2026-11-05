@@ -13,6 +13,8 @@ def main(argv=None):
         return drive_cli.upload_main(argv[1:])
     if argv and argv[0] == "configure-linear":
         return linear_cli.configure_main(argv[1:])
+    if argv and argv[0] == "linear-submit":
+        return linear_cli.submit_main(argv[1:])
     if argv and argv[0] == "linear-worker":
         return linear_cli.worker_main(argv[1:])
     return local_smoke.main(argv)

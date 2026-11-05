@@ -197,6 +197,40 @@ def _validate_params(operation, params):
     raise JobValidationError("unsupported_operation")
 
 
+def parse_job_description(description):
+    """Parse one raw Linear issue description without normalizing its JSON text."""
+    if not isinstance(description, str) or not description:
+        raise JobValidationError("description_must_be_text")
+    try:
+        encoded = description.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise JobValidationError("invalid_utf8") from exc
+    if len(encoded) > MAX_JOB_BYTES:
+        raise JobValidationError("job_too_large")
+    try:
+        request = json.loads(
+            description,
+            parse_constant=_reject_constant,
+            object_pairs_hook=_unique_object,
+        )
+    except JobValidationError:
+        raise
+    except (json.JSONDecodeError, TypeError, RecursionError) as exc:
+        raise JobValidationError("invalid_json") from exc
+    if not isinstance(request, dict) or set(request) != {"operation", "parameters"}:
+        raise JobValidationError("invalid_job_fields")
+    if not isinstance(request["parameters"], dict):
+        raise JobValidationError("parameters_must_be_object")
+    return request
+
+
+def validate_job_description(description):
+    """Parse and validate a Linear request with the same operation schema as the worker."""
+    request = parse_job_description(description)
+    _validate_params(request["operation"], request["parameters"])
+    return request
+
+
 def decode_job(raw, allowed_workspaces, now=None):
     """Decode and validate an incoming job. Only queued MVP operations are accepted."""
     if isinstance(raw, bytes):

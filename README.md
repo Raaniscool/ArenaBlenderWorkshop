@@ -201,6 +201,14 @@ For example:
 
 The worker generates `job_id` from the stable issue identifier (`linear-BLE-<number>`), fills protocol v1.0 fields and timestamps itself, and uses the already allowed `workspace_id: "test"`. The existing protocol validates the operation and every parameter. Unsupported fields/operations, duplicate JSON keys, malformed JSON, oversized requests, and invalid values are rejected and reported; the issue description is never interpreted as code.
 
+To submit from Windows without the connected Linear tool's JSON-argument coercion, use the repository CLI with a UTF-8 (no BOM) file containing the raw JSON object:
+
+```powershell
+python -m arena_workshop linear-submit --title "Create village ground" --description-file .\village-ground.json
+```
+
+`linear-submit` validates the request against the worker's shared protocol, creates the issue in `Backlog`, retrieves it again, and verifies that Linear returned the exact description text and JSON structure. It leaves the issue in `Backlog` unless `--dispatch` is supplied; that flag moves only the newly created, verified issue to `Todo` and verifies the state afterward. If the round trip cannot be verified, the CLI stops before dispatch and reports the created issue identifier when available. The API sends `description` as a GraphQL `String` variable; JSON escaping occurs only in the HTTP transport and is decoded by Linear as the original string.
+
 Only one Blender job is sent to the local mailbox at a time. The worker moves a new issue to `In Progress` after the stable-ID mailbox write, then waits for the add-on result. It reconciles existing inbox/processing/result files before enqueueing. A claimed job with no result after its deadline is reported as ambiguous for human review and is **not** automatically retried. Local terminal report records prevent a reopened issue from being executed a second time.
 
 ### Run and stop the worker

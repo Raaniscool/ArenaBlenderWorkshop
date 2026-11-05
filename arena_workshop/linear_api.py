@@ -11,6 +11,7 @@ import urllib.request
 from pathlib import Path
 
 from .drive import _dpapi_protect, _dpapi_unprotect
+from .protocol import JobValidationError, validate_job_description
 
 TOKEN_URL = "https://api.linear.app/oauth/token"
 GRAPHQL_URL = "https://api.linear.app/graphql"
@@ -226,6 +227,100 @@ class LinearApi:
         """Validate saved credentials during setup, then discard the token."""
         self.authenticate()
         self._access_token = None
+
+    def get_team_id(self, team_key):
+        data = self.graphql("""
+        query ArenaBlenderTeam($teamKey: String!) {
+          teams(filter: { key: { eq: $teamKey } }) {
+            nodes { id key }
+          }
+        }
+        """, {"teamKey": team_key})
+        connection = data.get("teams")
+        nodes = connection.get("nodes") if isinstance(connection, dict) else None
+        matches = [node for node in nodes or []
+                   if isinstance(node, dict) and node.get("key") == team_key
+                   and isinstance(node.get("id"), str)]
+        if len(matches) != 1:
+            raise LinearApiError("team_not_found", "Linear did not return exactly one matching job team.")
+        return matches[0]["id"]
+
+    def get_issue_label_id(self, team_id, label_name):
+        data = self.graphql("""
+        query ArenaBlenderIssueLabel($teamId: String!, $labelName: String!) {
+          issueLabels(filter: {
+            team: { id: { eq: $teamId } }
+            name: { eq: $labelName }
+          }) {
+            nodes { id name isGroup }
+          }
+        }
+        """, {"teamId": team_id, "labelName": label_name})
+        connection = data.get("issueLabels")
+        nodes = connection.get("nodes") if isinstance(connection, dict) else None
+        matches = [node for node in nodes or []
+                   if isinstance(node, dict) and node.get("name") == label_name
+                   and node.get("isGroup") is not True and isinstance(node.get("id"), str)]
+        if len(matches) != 1:
+            raise LinearApiError("job_label_not_found", "Linear did not return exactly one matching job label.")
+        return matches[0]["id"]
+
+    def create_issue(self, team_id, title, description, state_id, label_ids, priority=3):
+        """Create a queued-job issue with its description sent as a GraphQL String variable."""
+        if not isinstance(title, str) or not title.strip():
+            raise LinearApiError("invalid_issue_title", "A non-empty Linear issue title is required.")
+        if not isinstance(team_id, str) or not team_id or not isinstance(state_id, str) or not state_id:
+            raise LinearApiError("invalid_issue_target", "A Linear team and initial state are required.")
+        if (not isinstance(label_ids, (list, tuple)) or not label_ids
+                or any(not isinstance(value, str) or not value for value in label_ids)):
+            raise LinearApiError("invalid_issue_labels", "At least one valid Linear job label is required.")
+        if isinstance(priority, bool) or not isinstance(priority, int) or priority not in range(5):
+            raise LinearApiError("invalid_issue_priority", "Linear issue priority must be between 0 and 4.")
+        try:
+            validate_job_description(description)
+        except JobValidationError as exc:
+            raise LinearApiError(
+                "invalid_job_description",
+                "The issue description must be one valid Arena Blender JSON request.",
+            ) from exc
+
+        data = self.graphql("""
+        mutation ArenaBlenderCreateJobIssue(
+          $teamId: String!, $title: String!, $description: String!,
+          $stateId: String!, $labelIds: [String!]!, $priority: Int!
+        ) {
+          issueCreate(input: {
+            teamId: $teamId
+            title: $title
+            description: $description
+            stateId: $stateId
+            labelIds: $labelIds
+            priority: $priority
+          }) {
+            success
+            issue {
+              id identifier description
+              state { name }
+              team { key }
+              labels { nodes { name } }
+            }
+          }
+        }
+        """, {
+            "teamId": team_id,
+            "title": title.strip(),
+            # Pass the exact validated text. graphql() JSON-encodes variables once;
+            # Linear receives and stores this as a String, not a parsed object.
+            "description": description,
+            "stateId": state_id,
+            "labelIds": list(label_ids),
+            "priority": priority,
+        })
+        result = data.get("issueCreate")
+        issue = result.get("issue") if isinstance(result, dict) else None
+        if not isinstance(result, dict) or result.get("success") is not True or not isinstance(issue, dict):
+            raise LinearApiError("issue_create_failed", "Linear did not confirm the job issue creation.")
+        return issue
 
     def list_issues(self, state_name, team_key, label_name):
         query = """

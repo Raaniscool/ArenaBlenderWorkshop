@@ -133,6 +133,22 @@ class LinearWorkerTests(unittest.TestCase):
                 with self.assertRaises(WorkerError):
                     build_job_from_issue(make_issue(description=description))
 
+    def test_raw_description_round_trip_preserves_escaped_names_and_vectors(self):
+        description = json.dumps({
+            "operation": "create_primitive",
+            "parameters": {
+                "primitive_type": "cube",
+                "object_name": 'Village "Gate\\West',
+                "location": [1.25, -2, 3],
+                "rotation": [0, 45, 0],
+                "scale": [1, 2, 0.5],
+            },
+        }, separators=(",", ":"))
+        job = build_job_from_issue(make_issue(description=description))
+        self.assertEqual(job["parameters"]["object_name"], 'Village "Gate\\West')
+        self.assertEqual(job["parameters"]["location"], [1.25, -2, 3])
+        self.assertEqual(job["parameters"]["scale"], [1, 2, 0.5])
+
     def test_malformed_issue_is_failed_without_mailbox_enqueue(self):
         self.issue["description"] = '{"operation":"delete_object","parameters":{},"extra":true}'
         self.assertEqual(self.worker.run_once()[-1][1], "reported_invalid")

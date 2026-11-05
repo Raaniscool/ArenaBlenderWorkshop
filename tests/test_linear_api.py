@@ -1,4 +1,6 @@
 import base64
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -14,7 +16,8 @@ from arena_workshop.linear_api import (
     LinearApiError,
     LinearCredentialStore,
 )
-from arena_workshop.linear_cli import configure_credentials
+from arena_workshop.linear_cli import configure_credentials, submit_main
+from arena_workshop.protocol import JobValidationError, parse_job_description, validate_job_description
 
 
 class FakeResponse:
@@ -53,6 +56,32 @@ class LinearApiTests(unittest.TestCase):
         self.assertEqual(form["grant_type"], ["client_credentials"])
         self.assertEqual(form["scope"], [",".join(OAUTH_SCOPES)])
         self.assertEqual(set(OAUTH_SCOPES), {"read", "issues:create", "comments:create"})
+
+    def test_job_team_and_label_are_resolved_by_exact_key_and_name(self):
+        requests = []
+
+        def opener(request, timeout=30):
+            body = json.loads(request.data.decode("utf-8"))
+            requests.append(body)
+            if "ArenaBlenderTeam" in body["query"]:
+                return FakeResponse({"data": {"teams": {"nodes": [
+                    {"id": "team-id", "key": "BLE"},
+                ]}}})
+            if "ArenaBlenderIssueLabel" in body["query"]:
+                return FakeResponse({"data": {"issueLabels": {"nodes": [
+                    {"id": "label-id", "name": "arena-blender-job", "isGroup": False},
+                ]}}})
+            raise AssertionError("Unexpected GraphQL request")
+
+        api = LinearApi("client", "secret", opener=opener)
+        api._access_token = "test-token"
+        team_id = api.get_team_id("BLE")
+        label_id = api.get_issue_label_id(team_id, "arena-blender-job")
+
+        self.assertEqual(team_id, "team-id")
+        self.assertEqual(label_id, "label-id")
+        self.assertEqual(requests[0]["variables"], {"teamKey": "BLE"})
+        self.assertEqual(requests[1]["variables"], {"teamId": "team-id", "labelName": "arena-blender-job"})
 
     def test_graphql_401_fetches_one_new_in_memory_token_and_retries(self):
         requests = []
@@ -104,6 +133,100 @@ class LinearApiTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "graphql_error")
         self.assertNotIn("private detail", str(raised.exception))
 
+    def test_job_description_validation_accepts_nested_objects_arrays_and_escaped_strings(self):
+        request = {
+            "operation": "create_primitive",
+            "parameters": {
+                "primitive_type": "cube",
+                "object_name": 'Quoted "Village\\Gate',
+                "location": [1.25, -2, 3],
+                "rotation": [0, 45, 0],
+                "scale": [1, 2, 0.5],
+            },
+        }
+        description = json.dumps(request, separators=(",", ":"))
+        self.assertIn('\\"', description)
+        self.assertIn('\\\\', description)
+        request = validate_job_description(description)
+        self.assertEqual(request["parameters"]["location"], [1.25, -2, 3])
+        self.assertEqual(request["parameters"]["scale"], [1, 2, 0.5])
+        self.assertEqual(request["parameters"]["object_name"], 'Quoted "Village\\Gate')
+        self.assertEqual(parse_job_description(description), request)
+
+        string_request = {
+            "operation": "hello_test",
+            "parameters": {"message": 'He said "Welcome\\home"'},
+        }
+        string_description = json.dumps(string_request, separators=(",", ":"))
+        self.assertEqual(validate_job_description(string_description), string_request)
+
+    def test_issue_creation_rejects_missing_or_malformed_descriptions_before_network(self):
+        calls = []
+        api = LinearApi("client", "secret", opener=lambda *args, **kwargs: calls.append(args))
+        api._access_token = "test-token"
+        invalid = (
+            None,
+            "",
+            "not json",
+            '{"operation":"hello_test","parameters":{}}',
+            '{"operation":"create_primitive","operation":"delete_object","parameters":{}}',
+        )
+        for description in invalid:
+            with self.subTest(description=description), self.assertRaises(LinearApiError) as raised:
+                api.create_issue("team", "title", description, "backlog", ["label"])
+            self.assertEqual(raised.exception.code, "invalid_job_description")
+        self.assertEqual(calls, [])
+
+    def test_create_and_get_issue_round_trip_preserves_raw_json_and_structure(self):
+        expected = {
+            "operation": "create_primitive",
+            "parameters": {
+                "primitive_type": "cube",
+                "object_name": 'Quoted "Village\\Gate',
+                "location": [1.25, -2, 3],
+                "rotation": [0, 45, 0],
+                "scale": [1, 2, 0.5],
+            },
+        }
+        description = json.dumps(expected, separators=(",", ":"))
+        self.assertEqual(validate_job_description(description), expected)
+        requests = []
+        stored = {}
+
+        def opener(request, timeout=30):
+            body = json.loads(request.data.decode("utf-8"))
+            requests.append(body)
+            if "issueCreate" in body["query"]:
+                variables = body["variables"]
+                stored.update({
+                    "id": "issue-uuid-BLE-99",
+                    "identifier": "BLE-99",
+                    "title": variables["title"],
+                    "description": variables["description"],
+                    "team": {"key": "BLE"},
+                    "state": {"name": "Backlog"},
+                    "labels": {"nodes": [{"name": "arena-blender-job"}]},
+                })
+                return FakeResponse({"data": {"issueCreate": {"success": True, "issue": dict(stored)}}})
+            if "ArenaBlenderIssue" in body["query"]:
+                return FakeResponse({"data": {"issue": dict(stored)}})
+            raise AssertionError("Unexpected GraphQL request")
+
+        api = LinearApi("client", "secret", opener=opener)
+        api._access_token = "test-token"
+        created = api.create_issue(
+            team_id="team-id", title="JSON round trip", description=description,
+            state_id="backlog-id", label_ids=["label-id"],
+        )
+        retrieved = api.get_issue(created["identifier"])
+
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[0]["variables"]["description"], description)
+        self.assertEqual(created["description"], description)
+        self.assertEqual(retrieved["description"], description)
+        self.assertEqual(validate_job_description(retrieved["description"]), expected)
+        self.assertEqual(json.loads(retrieved["description"]), expected)
+
     def test_network_outage_is_retryable(self):
         def opener(request, timeout=30):
             raise urllib.error.URLError("offline")
@@ -113,6 +236,96 @@ class LinearApiTests(unittest.TestCase):
             api.authenticate()
         self.assertTrue(raised.exception.retryable)
         self.assertNotIn("secret", str(raised.exception))
+
+
+class LinearSubmitCliTests(unittest.TestCase):
+    class Store:
+        def load(self):
+            return {"client_id": "client", "client_secret": "secret"}
+
+    class Api:
+        def __init__(self, client_id, client_secret):
+            self.issue = None
+            self.state_updates = []
+
+        def get_team_id(self, team_key):
+            self.assert_team = team_key
+            return "team-id"
+
+        def get_workflow_states(self, team_key):
+            return {"Backlog": "backlog-id", "Todo": "todo-id"}
+
+        def get_issue_label_id(self, team_id, label_name):
+            self.assert_label = (team_id, label_name)
+            return "label-id"
+
+        def create_issue(self, **kwargs):
+            self.issue = {
+                "id": "issue-id",
+                "identifier": "BLE-900",
+                "description": kwargs["description"],
+                "state": {"name": "Backlog"},
+                "team": {"key": "BLE"},
+                "labels": {"nodes": [{"name": "arena-blender-job"}]},
+            }
+            return dict(self.issue)
+
+        def get_issue(self, identifier):
+            assert identifier == "BLE-900"
+            return dict(self.issue)
+
+        def update_issue_state(self, issue_id, state_id):
+            assert issue_id == "issue-id"
+            self.state_updates.append(state_id)
+            self.issue["state"] = {"name": "Todo"}
+
+    def test_submission_verifies_description_before_optional_dispatch(self):
+        expected = {
+            "operation": "create_primitive",
+            "parameters": {
+                "primitive_type": "cube",
+                "object_name": 'Gate "North\\West',
+                "location": [0, 2, -0.25],
+                "scale": [1.5, 1, 0.25],
+            },
+        }
+        description = json.dumps(expected, separators=(",", ":"))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "job.json"
+            path.write_bytes(description.encode("utf-8"))
+            api = self.Api("client", "secret")
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                status = submit_main(
+                    ["--title", "Queued job", "--description-file", str(path), "--dispatch"],
+                    store=self.Store(), api_factory=lambda *args: api,
+                )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(api.issue["description"], description)
+        self.assertEqual(api.issue["state"]["name"], "Todo")
+        self.assertEqual(api.state_updates, ["todo-id"])
+        self.assertTrue(json.loads(output.getvalue())["description_verified"])
+
+    def test_submission_keeps_unverified_or_invalid_jobs_out_of_todo(self):
+        class UnusedStore:
+            def load(self):
+                raise AssertionError("credentials should not load for invalid descriptions")
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bad.json"
+            path.write_text("{bad", encoding="utf-8")
+            with contextlib.redirect_stderr(io.StringIO()):
+                status = submit_main(
+                    ["--title", "Bad job", "--description-file", str(path)],
+                    store=UnusedStore(),
+                )
+            self.assertEqual(status, 2)
+            with contextlib.redirect_stderr(io.StringIO()):
+                missing_status = submit_main(
+                    ["--title", "Missing job", "--description-file", str(Path(directory) / "missing.json")],
+                    store=UnusedStore(),
+                )
+            self.assertEqual(missing_status, 2)
 
 
 class CredentialStoreTests(unittest.TestCase):

@@ -13,7 +13,12 @@ from pathlib import Path
 
 from .linear_api import LinearApiError
 from .mailbox import FileMailbox, default_queue_root
-from .protocol import JobValidationError, MAX_JOB_BYTES, SUPPORTED_OPERATIONS, validate_job
+from .protocol import (
+    JobValidationError,
+    SUPPORTED_OPERATIONS,
+    parse_job_description,
+    validate_job,
+)
 
 _LOG = logging.getLogger("arena_blender_workshop.linear_worker")
 TEAM_KEY = "BLE"
@@ -42,19 +47,6 @@ def stable_job_id(identifier):
     return "linear-" + identifier
 
 
-def _reject_json_constant(value):
-    raise ValueError("non-finite number")
-
-
-def _unique_json_object(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("duplicate key")
-        result[key] = value
-    return result
-
-
 def build_job_from_issue(issue, now=None):
     """Validate strict issue-description JSON and create a local protocol v1 job."""
     team = issue.get("team") if isinstance(issue, dict) else None
@@ -63,28 +55,26 @@ def build_job_from_issue(issue, now=None):
     identifier = issue.get("identifier")
     job_id = stable_job_id(identifier)
     description = issue.get("description")
-    if not isinstance(description, str) or not description:
-        raise WorkerError("invalid_job_json", "The issue description must contain only a JSON request object.")
     try:
-        encoded = description.encode("utf-8")
-    except UnicodeEncodeError as exc:
-        raise WorkerError("invalid_job_json", "The issue description is not valid UTF-8 JSON.") from exc
-    if len(encoded) > MAX_JOB_BYTES:
-        raise WorkerError("job_too_large", "The Blender job request exceeds the protocol size limit.")
-    try:
-        request = json.loads(
-            description,
-            parse_constant=_reject_json_constant,
-            object_pairs_hook=_unique_json_object,
-        )
-    except (ValueError, TypeError):
-        raise WorkerError("invalid_job_json", "The issue description must be one strict JSON object with no duplicate keys.")
-    if not isinstance(request, dict) or set(request) != {"operation", "parameters"}:
-        raise WorkerError("invalid_job_fields", "The JSON request must contain exactly operation and parameters.")
+        request = parse_job_description(description)
+    except JobValidationError as exc:
+        code = str(exc)
+        if code == "job_too_large":
+            raise WorkerError("job_too_large", "The Blender job request exceeds the protocol size limit.") from exc
+        if code == "invalid_utf8":
+            raise WorkerError("invalid_job_json", "The issue description is not valid UTF-8 JSON.") from exc
+        if code in {"invalid_json", "duplicate_json_key", "non_finite_json_number", "description_must_be_text"}:
+            raise WorkerError(
+                "invalid_job_json",
+                "The issue description must be one strict JSON object with no duplicate keys.",
+            ) from exc
+        if code == "invalid_job_fields":
+            raise WorkerError("invalid_job_fields", "The JSON request must contain exactly operation and parameters.") from exc
+        if code == "parameters_must_be_object":
+            raise WorkerError("invalid_parameters", "The operation parameters must be a JSON object.") from exc
+        raise WorkerError("invalid_job_json", "The issue description is not a valid job request.") from exc
     if not isinstance(request["operation"], str) or request["operation"] not in SUPPORTED_OPERATIONS:
         raise WorkerError("unsupported_operation", "The requested Blender operation is not allowlisted.")
-    if not isinstance(request["parameters"], dict):
-        raise WorkerError("invalid_parameters", "The operation parameters must be a JSON object.")
 
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).replace(microsecond=0)
     job = {
